@@ -49,7 +49,8 @@ from security import get_system_prompt, validate_output, sanitize_search_query
 from exceptions import APIError
 from config import (
     EMBEDDING_MODEL,
-    LLM_MODEL,
+    PRIMARY_LLM_MODEL,
+    FALLBACK_LLM_MODEL,
     LLM_TEMPERATURE,
     MAX_AGENT_ITERATIONS,
     DEFAULT_TOP_K,
@@ -83,7 +84,7 @@ class _JSONFormatter(logging.Formatter):
             "mod": record.module,
             "msg": record.getMessage(),
         }
-        for key in ("duration_ms", "api_service", "error_code", "query_len", "chunk_count"):
+        for key in ("duration_ms", "api_service", "error_code", "is_rate_limit", "query_len", "chunk_count"):
             val = getattr(record, key, None)
             if val is not None:
                 entry[key] = val
@@ -136,20 +137,36 @@ def _tokenize(text: str) -> list[str]:
 
 # ── Retry helper for Gemini API calls ──────────────────────
 
+def _is_rate_limit(exc: Exception) -> bool:
+    """Check if an exception indicates a rate limit / quota error."""
+    msg = str(exc).lower()
+    if any(kw in msg for kw in ("429", "ratelimit", "rate limit", "resource exhausted", "quota")):
+        return True
+    if hasattr(exc, "status_code") and exc.status_code == 429:  # type: ignore[union-attr]
+        return True
+    if hasattr(exc, "code") and exc.code == 429:  # type: ignore[union-attr]
+        return True
+    return False
+
+
 def _invoke_with_retry(callable_fn, max_attempts=3, service="gemini"):
     """
     Invokes a callable with exponential backoff retry on failure.
 
-    Targets transient API errors (rate limits, server hiccups) by
-    sleeping 1s, then 2s, then 4s between attempts. After exhausting
-    retries raises APIError so the caller can distinguish infrastructure
-    failures from expected states (empty KB, blocked content).
+    Rate-limit errors (429 / ResourceExhausted) get longer backoff:
+      5s, 10s, 20s — giving the quota window time to recover.
+    All other transient errors get shorter backoff: 1s, 2s, 4s.
+
+    After exhausting retries raises APIError so the caller can
+    distinguish infrastructure failures from expected states
+    (empty KB, blocked content).
 
     Usage:
         result = _invoke_with_retry(lambda: llm.invoke(prompt))
     """
     start = time.perf_counter()
     last_exc = None
+    is_rate = False
     for attempt in range(max_attempts):
         try:
             result = callable_fn()
@@ -163,18 +180,22 @@ def _invoke_with_retry(callable_fn, max_attempts=3, service="gemini"):
             return result
         except Exception as e:
             last_exc = e
+            is_rate = _is_rate_limit(e)
+            delay = (2 ** attempt) * 5 if is_rate else (2 ** attempt)  # rate: 5,10,20s else 1,2,4s
             logger.warning(
-                "%s call failed (attempt %d/%d): %s",
-                service, attempt + 1, max_attempts, e,
-                extra={"api_service": service},
+                "%s call failed (attempt %d/%d, retry in %ds): %s",
+                service, attempt + 1, max_attempts, delay, e,
+                extra={"api_service": service, "is_rate_limit": is_rate},
             )
             if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                time.sleep(delay)
     duration_ms = (time.perf_counter() - start) * 1000
     _record_metric(f"{service}_error_count", 1)
+    _record_metric(f"{service}_rate_limited" if is_rate else f"{service}_failed", 1)
     raise APIError(
         message=f"{service} API unreachable after {max_attempts} attempts: {last_exc}",
         service=service,
+        status_code=429 if is_rate else 0,
     ) from last_exc
 
 
@@ -845,13 +866,13 @@ def query_agent(
             "No search tools are available in the current mode."
         )
 
-    # ── Initialize LLM ──────────────────────────────────────
-    llm = ChatGoogleGenerativeAI(
-        model=LLM_MODEL,
-        google_api_key=api_key,
-        temperature=LLM_TEMPERATURE,
-    )
+    # ── Initialize LLM with model fallback ─────────────────
+    def _try_llm(model: str) -> ChatGoogleGenerativeAI:
+        return ChatGoogleGenerativeAI(
+            model=model, google_api_key=api_key, temperature=LLM_TEMPERATURE,
+        )
 
+    llm = _try_llm(PRIMARY_LLM_MODEL)
     system_prompt = get_system_prompt(domain, mode=mode)
 
     # Build tool descriptions dict for prompt generation
@@ -867,8 +888,22 @@ def query_agent(
             response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm")
             text = response.content if hasattr(response, "content") else str(response)
         except APIError as e:
-            logger.error("LLM failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
-            return f"The AI model is temporarily unavailable ({e.service}). Please try again in a few seconds."
+            if e.status_code == 429 and llm.model == PRIMARY_LLM_MODEL:
+                logger.warning("Rate limited on %s, falling back to %s", PRIMARY_LLM_MODEL, FALLBACK_LLM_MODEL)
+                _record_metric("primary_rate_limited", 1)
+                llm = _try_llm(FALLBACK_LLM_MODEL)
+                try:
+                    response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm-fallback")
+                    text = response.content if hasattr(response, "content") else str(response)
+                except APIError as e2:
+                    logger.error("Fallback LLM also failed: %s", e2)
+                    return "AI model is temporarily unavailable. Please wait a moment and try again."
+                except Exception as e2:
+                    logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
+                    return "An unexpected error occurred. Please try again."
+            else:
+                logger.error("LLM failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+                return f"The AI model is temporarily unavailable. Please try again in a few seconds."
         except Exception as e:
             logger.error("LLM invocation failed: %s", e, exc_info=True)
             return f"An unexpected error occurred while contacting the AI model."
@@ -946,12 +981,12 @@ def direct_chat(
     Returns:
         Validated response string.
     """
-    llm = ChatGoogleGenerativeAI(
-        model=LLM_MODEL,
-        google_api_key=api_key,
-        temperature=LLM_TEMPERATURE,
-    )
+    def _try_llm(model: str) -> ChatGoogleGenerativeAI:
+        return ChatGoogleGenerativeAI(
+            model=model, google_api_key=api_key, temperature=LLM_TEMPERATURE,
+        )
 
+    llm = _try_llm(PRIMARY_LLM_MODEL)
     system_prompt = get_system_prompt(domain, mode=MODE_DIRECT)
 
     # Build message list from recent chat history
@@ -970,8 +1005,23 @@ def direct_chat(
         text = response.content if hasattr(response, "content") else str(response)
         return validate_output(text)
     except APIError as e:
-        logger.error("Direct chat failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
-        return f"The AI model is temporarily unavailable ({e.service}). Please try again."
+        if e.status_code == 429 and llm.model == PRIMARY_LLM_MODEL:
+            logger.warning("Rate limited on %s, falling back to %s", PRIMARY_LLM_MODEL, FALLBACK_LLM_MODEL)
+            _record_metric("primary_rate_limited", 1)
+            llm = _try_llm(FALLBACK_LLM_MODEL)
+            try:
+                response = _invoke_with_retry(lambda: llm.invoke(messages), service="gemini-chat-fallback")
+                text = response.content if hasattr(response, "content") else str(response)
+                return validate_output(text)
+            except APIError as e2:
+                logger.error("Fallback LLM also failed: %s", e2)
+                return "AI model is temporarily unavailable. Please wait a moment and try again."
+            except Exception as e2:
+                logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
+                return "An unexpected error occurred. Please try again."
+        else:
+            logger.error("Direct chat failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+            return f"The AI model is temporarily unavailable. Please try again."
     except Exception as e:
         logger.error("Direct chat failed: %s", e, exc_info=True)
         return f"An unexpected error occurred while contacting the AI model."
@@ -1052,7 +1102,7 @@ def multimodal_query(
     try:
         response = _invoke_with_retry(
             lambda: client.models.generate_content(
-                model=LLM_MODEL,
+                model=PRIMARY_LLM_MODEL,
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     full_prompt,
@@ -1062,8 +1112,30 @@ def multimodal_query(
         )
         return validate_output(response.text)
     except APIError as e:
-        logger.error("Multimodal query failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
-        return f"The AI model is temporarily unavailable ({e.service}). Please try again."
+        if e.status_code == 429:
+            logger.warning("Rate limited on primary vision model, trying fallback %s", FALLBACK_LLM_MODEL)
+            _record_metric("primary_rate_limited", 1)
+            try:
+                response = _invoke_with_retry(
+                    lambda: client.models.generate_content(
+                        model=FALLBACK_LLM_MODEL,
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            full_prompt,
+                        ],
+                    ),
+                    service="gemini-vision-fallback",
+                )
+                return validate_output(response.text)
+            except APIError as e2:
+                logger.error("Fallback vision model also failed: %s", e2)
+                return "AI model is temporarily unavailable. Please wait a moment and try again."
+            except Exception as e2:
+                logger.error("Fallback vision unexpected error: %s", e2, exc_info=True)
+                return "An unexpected error occurred. Please try again."
+        else:
+            logger.error("Multimodal query failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+            return f"The AI model is temporarily unavailable. Please try again."
     except Exception as e:
         logger.error("Multimodal query failed: %s", e, exc_info=True)
         return f"An unexpected error occurred while processing your image query."

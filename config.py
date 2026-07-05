@@ -9,10 +9,17 @@ behavior without touching core logic.
 
 # ── Model Configuration ──────────────────────────────────────
 # Embedding model for vectorization (via Google Gemini API)
+# Converts text to vector embeddings for semantic search in FAISS.
 EMBEDDING_MODEL: str = "models/gemini-embedding-001"
 
-# LLM model for generation and ReAct reasoning
-LLM_MODEL: str = "gemini-2.5-flash-lite"
+# Primary LLM for generation and ReAct reasoning
+PRIMARY_LLM_MODEL: str = "gemini-2.5-flash-lite"
+
+# Fallback LLM when primary is rate-limited (different quota pool)
+FALLBACK_LLM_MODEL: str = "gemini-2.0-flash"
+
+# Alias for backward-compatible access
+LLM_MODEL: str = PRIMARY_LLM_MODEL
 
 # Low temperature for deterministic, factual responses
 LLM_TEMPERATURE: float = 0.1
