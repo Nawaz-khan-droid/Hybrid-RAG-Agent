@@ -11,8 +11,8 @@
 streamlit>=1.32.0,<2.0.0
 
 # LangChain (selective modules only, no agents/chains)
+# FAISS is used directly (faiss.IndexFlatL2), not via langchain wrappers
 langchain-google-genai>=2.0.0,<3.0.0
-langchain-community>=0.3.0,<0.4.0
 langchain-core>=0.3.0,<0.4.0
 
 # Retrieval

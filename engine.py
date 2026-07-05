@@ -38,8 +38,8 @@ import logging
 from typing import Optional, Callable
 
 import numpy as np
+import faiss
 from rank_bm25 import BM25Okapi
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import (
     GoogleGenerativeAIEmbeddings,
     ChatGoogleGenerativeAI,
@@ -225,7 +225,7 @@ class HybridKnowledgeBase:
             model=EMBEDDING_MODEL,
             google_api_key=api_key,
         )
-        self.vectorstore: Optional[FAISS] = None
+        self.vector_index: Optional[faiss.Index] = None
         self.bm25: Optional[BM25Okapi] = None
         self.corpus: list[str] = []
         self.metadata: list[dict] = []
@@ -272,13 +272,13 @@ class HybridKnowledgeBase:
         self.corpus.extend(chunks)
         self.metadata.extend(metas)
 
-        # FAISS: create new or append to existing
-        if self.vectorstore is None:
-            self.vectorstore = FAISS.from_texts(
-                chunks, self.embeddings, metadatas=metas
-            )
-        else:
-            self.vectorstore.add_texts(chunks, metadatas=metas)
+        # FAISS: embed and index directly (no langchain wrapper)
+        vectors = np.array(
+            self.embeddings.embed_documents(chunks), dtype=np.float32
+        )
+        if self.vector_index is None:
+            self.vector_index = faiss.IndexFlatL2(vectors.shape[1])
+        self.vector_index.add(vectors)
 
         # BM25: full rebuild (BM25Okapi lacks incremental update)
         tokenized_corpus = [_tokenize(doc) for doc in self.corpus]
@@ -337,19 +337,16 @@ class HybridKnowledgeBase:
         # ── 2. FAISS Vector Scores ───────────────────────────
         vector_norm = np.zeros(n, dtype=np.float64)
 
-        if self.vectorstore is not None:
-            docs_with_scores = self.vectorstore.similarity_search_with_score(
-                query, k=n
-            )
-            for doc, score in docs_with_scores:
-                # Convert L2 distance to similarity: closer = higher score
-                similarity = 1.0 / (1.0 + float(score))
-                try:
-                    idx = self.corpus.index(doc.page_content)
+        if self.vector_index is not None:
+            query_vec = np.array(
+                self.embeddings.embed_query(query), dtype=np.float32
+            ).reshape(1, -1)
+            distances, indices = self.vector_index.search(query_vec, n)
+            for i in range(n):
+                idx = indices[0][i]
+                if idx != -1:
+                    similarity = 1.0 / (1.0 + float(distances[0][i]))
                     vector_norm[idx] = similarity
-                except ValueError:
-                    # Edge case: content not in corpus (should not happen)
-                    pass
 
             v_max = vector_norm.max()
             if v_max > 0:
