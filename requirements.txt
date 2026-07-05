@@ -1,0 +1,37 @@
+# Secure Hybrid RAG v2.0 - Python Dependencies
+# Tested for Streamlit Community Cloud (free tier, ~1 GB RAM).
+# All heavy computation (embeddings, LLM, vision) uses remote APIs.
+# No local models are downloaded.
+#
+# NOTE: langchain.agents and langchain.chains are intentionally NOT
+# listed here. The ReAct agent loop uses a manual tool registry
+# in engine.py, avoiding pydantic crashes on Python 3.14+.
+
+# Core framework
+streamlit>=1.32.0,<2.0.0
+
+# LangChain (selective modules only, no agents/chains)
+langchain-google-genai>=2.0.0,<3.0.0
+langchain-community>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+
+# Retrieval
+faiss-cpu>=1.8.0,<2.0.0
+rank-bm25>=0.2.2,<1.0.0
+
+# Google AI (embedding, LLM, multimodal vision)
+google-genai>=0.3.0,<2.0.0
+
+# Web search
+tavily-python>=0.5.0,<1.0.0
+ddgs>=9.0.0,<10.0.0
+
+# Document processing
+PyPDF2>=3.0.1,<4.0.0
+
+# Image support
+pillow>=10.0.0,<12.0.0
+
+# HTTP (for DDG and local URL fallback)
+requests>=2.31.0,<3.0.0
+
