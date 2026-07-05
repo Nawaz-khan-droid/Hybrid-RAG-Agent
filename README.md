@@ -1,12 +1,12 @@
 # Secure Hybrid RAG Agent
 
-A production-ready, multimodal RAG (Retrieval-Augmented Generation) system with a ReAct agent, deployable on **Streamlit Community Cloud** (free tier).
+A functional prototype of a RAG (Retrieval-Augmented Generation) system with a ReAct agent, deployable on **Streamlit Community Cloud** (free tier). Designed for single-user experimentation and small-scale demos, not production workloads.
 
 ## Features
 
 - **Hybrid Search** - Combines BM25 keyword search with FAISS semantic vector search using weighted score fusion.
 - **ReAct Agent** - Manual ReAct loop (no langchain.agents) that reasons about when to search the knowledge base before answering.
-- **Multimodal Queries** - Attach images to questions; analyzed via Gemini's native vision API alongside retrieved text context.
+- **Image Analysis** - Attach images to questions; analyzed via Gemini's native vision API alongside retrieved text context. Note: image support bypasses the ReAct agent loop — tools are not available alongside visual queries.
 - **Domain Configuration** - Switch the agent's persona between Financial, Healthcare, Legal, Technology, or General.
 - **Document Upload** - Upload PDF or TXT files to build a custom knowledge base in real time.
 - **Security Guardrails** - Dual-layer defense: pre-execution input sanitization + post-generation output validation.
@@ -29,6 +29,31 @@ User Query
     v
 [Security Layer 2: Output Validation] --> Final Answer
 ```
+
+## Production Readiness
+
+This codebase is a **functional prototype**, not a production system. The following gaps must be addressed before real-world use:
+
+| Gap | Details |
+|-----|---------|
+| **Error hardening** | API failures return user-facing strings, not structured exceptions. Downstream callers cannot distinguish quota errors from network failures. |
+| **Testing** | No unit, integration, or end-to-end tests exist. No CI/CD pipeline. |
+| **Observability** | No metrics, no tracing, no health endpoint. Debugging relies entirely on Streamlit Cloud's raw stdout logs. |
+| **Multimodal agent loop** | Image queries bypass the ReAct agent entirely — the agent cannot use tools (web search, KB search) alongside visual analysis in a single turn. |
+| **Scalability** | All state is in-process memory (FAISS index, BM25 corpus, chat history). No database, no queue, no horizontal scaling. Designed for exactly one concurrent user. |
+| **Secrets management** | Keys are loaded via `st.secrets` only. No fallback to environment variables or vaults for non-Streamlit deployments. |
+| **Dependency locking** | `requirements.txt` uses loose upper bounds. No lockfile — builds are not reproducible. |
+
+### Can Langfuse be added for observability within 1 GB RAM?
+
+**Yes, with caveats.** Langfuse's Python SDK v3 (OpenTelemetry-based, GA since June 2025) batches traces in the background and can run within 1 GB if:
+
+- **Reuse the client as a singleton** — creating a new Langfuse client per request creates background threads that accumulate and cause OOM (see [langfuse#3456](https://github.com/langfuse/langfuse/issues/3456))
+- **Set `capture_input=False`** — the SDK famously leaked memory when storing large prompt payloads; see [langfuse#5032](https://github.com/langfuse/langfuse/issues/5032) (Django dev server: 600 MB → 4 GB in 1 minute)
+- **Set `LANGFUSE_FLUSH_AT=32`** — lower batch size prevents in-memory span queue from growing too large
+- **Use the cloud API** — self-hosting the Langfuse backend is not feasible on 1 GB
+
+A simpler alternative with zero memory risk: **structured JSON logging to stdout** paired with Streamlit Cloud's built-in log viewer or a log shipping service.
 
 ## Quick Start (Local Testing)
 
