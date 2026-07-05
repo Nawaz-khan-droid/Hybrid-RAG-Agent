@@ -57,6 +57,7 @@ from engine import (
     fetch_url_content,
     extract_text_from_file,
     chunk_text,
+    get_metrics_snapshot,
 )
 from security import (
     sanitize_input,
@@ -428,6 +429,17 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    with st.expander("Telemetry (latency ms)", expanded=False):
+        snap = get_metrics_snapshot()
+        if snap:
+            for name, stats in snap.items():
+                st.caption(
+                    f"{name}: avg={stats['avg']:.0f} "
+                    f"p95={stats['p95']:.0f} "
+                    f"n={stats['count']}"
+                )
+        else:
+            st.caption("No data yet — send a query")
     st.caption(
         "Secure Hybrid RAG v2.0\n"
         "Powered by Gemini + FAISS + BM25 + Web Search"

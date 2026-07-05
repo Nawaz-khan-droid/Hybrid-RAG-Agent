@@ -140,6 +140,8 @@ def sanitize_search_query(query: str) -> str:
     """
     # Remove control characters except space
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", query)
+    # Strip HTML tags to prevent XSS in search results
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
     # Truncate to safe length
     return cleaned[:MAX_SEARCH_QUERY_LENGTH].strip()
 

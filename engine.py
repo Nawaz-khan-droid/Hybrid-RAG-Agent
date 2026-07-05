@@ -32,6 +32,7 @@ Design decisions for Streamlit Community Cloud (1 GB RAM):
 """
 
 import re
+import json
 import time
 import logging
 from typing import Optional, Callable
@@ -45,6 +46,7 @@ from langchain_google_genai import (
 )
 
 from security import get_system_prompt, validate_output, sanitize_search_query
+from exceptions import APIError
 from config import (
     EMBEDDING_MODEL,
     LLM_MODEL,
@@ -70,6 +72,57 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+# ── Structured JSON Logging ────────────────────────────────
+
+class _JSONFormatter(logging.Formatter):
+    """Formats log records as newline-delimited JSON for machine parsing."""
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, object] = {
+            "t": self.formatTime(record),
+            "lvl": record.levelname,
+            "mod": record.module,
+            "msg": record.getMessage(),
+        }
+        for key in ("duration_ms", "api_service", "error_code", "query_len", "chunk_count"):
+            val = getattr(record, key, None)
+            if val is not None:
+                entry[key] = val
+        return json.dumps(entry, default=str)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JSONFormatter())
+logger.root.handlers.clear()
+logger.root.addHandler(_handler)
+logger.root.setLevel(logging.INFO)
+
+
+# ── Lightweight In-Memory Metrics ──────────────────────────
+
+_metrics: dict[str, list[float]] = {}
+
+def _record_metric(name: str, value: float) -> None:
+    _metrics.setdefault(name, []).append(value)
+    # Keep only last 500 to bound memory
+    if len(_metrics[name]) > 500:
+        _metrics[name] = _metrics[name][-250:]
+
+def get_metrics_snapshot() -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for name, vals in _metrics.items():
+        if vals:
+            s_vals = sorted(vals)
+            n = len(s_vals)
+            summary[name] = {
+                "count": n,
+                "min": s_vals[0],
+                "p50": s_vals[n // 2],
+                "p95": s_vals[int(n * 0.95)],
+                "max": s_vals[-1],
+                "avg": sum(vals) / n,
+            }
+    return summary
+
+
 # ── Tokenizer for BM25 ──────────────────────────────────────
 
 def _tokenize(text: str) -> list[str]:
@@ -83,31 +136,46 @@ def _tokenize(text: str) -> list[str]:
 
 # ── Retry helper for Gemini API calls ──────────────────────
 
-def _invoke_with_retry(callable_fn, max_attempts=3):
+def _invoke_with_retry(callable_fn, max_attempts=3, service="gemini"):
     """
     Invokes a callable with exponential backoff retry on failure.
 
     Targets transient API errors (rate limits, server hiccups) by
-    sleeping 1s, then 2s, then 4s between attempts. Permanent errors
-    (auth, invalid args) are re-raised after exhausting retries so the
-    caller's existing error handling takes over.
+    sleeping 1s, then 2s, then 4s between attempts. After exhausting
+    retries raises APIError so the caller can distinguish infrastructure
+    failures from expected states (empty KB, blocked content).
 
     Usage:
         result = _invoke_with_retry(lambda: llm.invoke(prompt))
     """
+    start = time.perf_counter()
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            return callable_fn()
+            result = callable_fn()
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "%s call succeeded in %.0fms (attempt %d)",
+                service, duration_ms, attempt + 1,
+                extra={"duration_ms": duration_ms, "api_service": service},
+            )
+            _record_metric(f"{service}_latency_ms", duration_ms)
+            return result
         except Exception as e:
             last_exc = e
             logger.warning(
-                "API call failed (attempt %d/%d): %s",
-                attempt + 1, max_attempts, e,
+                "%s call failed (attempt %d/%d): %s",
+                service, attempt + 1, max_attempts, e,
+                extra={"api_service": service},
             )
             if attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)  # 1s, 2s, 4s
-    raise last_exc  # type: ignore[misc]
+    duration_ms = (time.perf_counter() - start) * 1000
+    _record_metric(f"{service}_error_count", 1)
+    raise APIError(
+        message=f"{service} API unreachable after {max_attempts} attempts: {last_exc}",
+        service=service,
+    ) from last_exc
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -796,11 +864,14 @@ def query_agent(
 
     for iteration in range(MAX_AGENT_ITERATIONS + 1):
         try:
-            response = _invoke_with_retry(lambda: llm.invoke(conversation))
+            response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm")
             text = response.content if hasattr(response, "content") else str(response)
+        except APIError as e:
+            logger.error("LLM failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+            return f"The AI model is temporarily unavailable ({e.service}). Please try again in a few seconds."
         except Exception as e:
-            logger.error("LLM invocation failed: %s", e)
-            return f"An error occurred while contacting the AI model: {e}"
+            logger.error("LLM invocation failed: %s", e, exc_info=True)
+            return f"An unexpected error occurred while contacting the AI model."
 
         last_text = text
 
@@ -895,12 +966,15 @@ def direct_chat(
     messages.append({"role": "user", "content": query})
 
     try:
-        response = _invoke_with_retry(lambda: llm.invoke(messages))
+        response = _invoke_with_retry(lambda: llm.invoke(messages), service="gemini-chat")
         text = response.content if hasattr(response, "content") else str(response)
         return validate_output(text)
+    except APIError as e:
+        logger.error("Direct chat failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+        return f"The AI model is temporarily unavailable ({e.service}). Please try again."
     except Exception as e:
-        logger.error("Direct chat failed: %s", e)
-        return f"An error occurred while contacting the AI model: {e}"
+        logger.error("Direct chat failed: %s", e, exc_info=True)
+        return f"An unexpected error occurred while contacting the AI model."
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -983,14 +1057,16 @@ def multimodal_query(
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     full_prompt,
                 ],
-            )
+            ),
+            service="gemini-vision",
         )
         return validate_output(response.text)
+    except APIError as e:
+        logger.error("Multimodal query failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+        return f"The AI model is temporarily unavailable ({e.service}). Please try again."
     except Exception as e:
-        logger.error("Multimodal query failed: %s", e)
-        return (
-            f"An error occurred while processing your image query: {e}"
-        )
+        logger.error("Multimodal query failed: %s", e, exc_info=True)
+        return f"An unexpected error occurred while processing your image query."
 
 
 # ═══════════════════════════════════════════════════════════════
