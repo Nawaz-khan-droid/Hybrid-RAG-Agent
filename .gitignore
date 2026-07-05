@@ -20,6 +20,9 @@ nohup.out
 .DS_Store
 Thumbs.db
 
+# Pytest cache
+.pytest_cache/
+
 # Virtual environments
 venv/
 .venv/
