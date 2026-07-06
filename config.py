@@ -10,7 +10,10 @@ behavior without touching core logic.
 # ── Model Configuration ──────────────────────────────────────
 # Embedding model for vectorization (via Google Gemini API)
 # Converts text to vector embeddings for semantic search in FAISS.
-EMBEDDING_MODEL: str = "models/gemini-embedding-001"
+EMBEDDING_MODEL: str = "models/gemini-embedding-2"
+
+# Fallback embedding model (separate quota pool)
+FALLBACK_EMBEDDING_MODEL: str = "models/gemini-embedding-2-preview"
 
 # Primary LLM for generation and ReAct reasoning
 # Uses the fastest available flash-lite model for low latency.

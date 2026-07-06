@@ -44,6 +44,7 @@ from langchain_google_genai import (
     GoogleGenerativeAIEmbeddings,
     ChatGoogleGenerativeAI,
 )
+from google.api_core.exceptions import ResourceExhausted
 
 from security import get_system_prompt, validate_output, sanitize_search_query
 from exceptions import APIError
@@ -51,6 +52,7 @@ from config import (
     EMBEDDING_MODEL,
     PRIMARY_LLM_MODEL,
     FALLBACK_LLM_MODEL,
+    FALLBACK_EMBEDDING_MODEL,
     LLM_TEMPERATURE,
     MAX_AGENT_ITERATIONS,
     DEFAULT_TOP_K,
@@ -341,9 +343,22 @@ class HybridKnowledgeBase:
         self.metadata.extend(metas)
 
         # FAISS: embed and index directly (no langchain wrapper)
-        vectors = np.array(
-            self.embeddings.embed_documents(chunks), dtype=np.float32
-        )
+        try:
+            vectors = np.array(
+                self.embeddings.embed_documents(chunks), dtype=np.float32
+            )
+        except ResourceExhausted:
+            logger.warning(
+                "Embedding model %s quota exhausted, falling back to %s",
+                EMBEDDING_MODEL, FALLBACK_EMBEDDING_MODEL,
+            )
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model=FALLBACK_EMBEDDING_MODEL,
+                google_api_key=self.api_key,
+            )
+            vectors = np.array(
+                self.embeddings.embed_documents(chunks), dtype=np.float32
+            )
         if self.vector_index is None:
             self.vector_index = faiss.IndexFlatL2(vectors.shape[1])
         self.vector_index.add(vectors)
