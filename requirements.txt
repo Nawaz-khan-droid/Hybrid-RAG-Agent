@@ -29,6 +29,7 @@ ddgs>=9.0.0,<10.0.0
 # Document processing
 pypdf>=4.0.0,<6.0.0
 PyPDF2>=3.0.1,<4.0.0
+pymupdf>=1.25.0,<2.0.0
 
 # Image support
 pillow>=10.0.0,<12.0.0
