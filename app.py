@@ -351,6 +351,9 @@ with st.sidebar:
                     f"Added {total_chunks} chunks from "
                     f"{total_files} file(s) to the knowledge base."
                 )
+                # Clear uploader state so next rerun doesn't reprocess
+                st.session_state.pop("kb_uploader", None)
+                st.rerun()
             else:
                 st.error(
                     "No text could be extracted from the uploaded files. "
@@ -418,6 +421,8 @@ with st.sidebar:
                             f"Fetched and indexed {count} chunks from "
                             f"{len(valid_urls)} URL(s)."
                         )
+                        st.session_state.pop("url_input_area", None)
+                        st.rerun()
                     else:
                         st.warning(
                             "URL content was fetched but produced no "
