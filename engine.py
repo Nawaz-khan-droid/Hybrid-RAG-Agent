@@ -536,10 +536,10 @@ def fetch_url_content(
     """
     Fetches and extracts text content from one or more URLs.
 
-    Uses Tavily's extract API which fetches and parses pages
-    server-side, avoiding SSRF risk on the Streamlit instance.
-    If Tavily is unavailable, falls back to a local HTTP fetcher
-    (with SSRF protections applied by the caller via validate_url).
+    Tries providers in order:
+      1. Tavily Extract (server-side, best quality, needs API key)
+      2. Jina Reader (free 1000 req/month, clean markdown, no key needed)
+      3. Local HTTP fetcher with regex HTML stripping (last resort)
 
     Args:
         urls: List of URL strings to fetch.
@@ -556,7 +556,12 @@ def fetch_url_content(
         result = _fetch_urls_tavily(urls, tavily_api_key)
         if result:
             return result
-        logger.warning("Tavily extract failed, falling back to local fetch.")
+        logger.warning("Tavily extract failed, trying Jina Reader.")
+
+    result = _fetch_urls_jina(urls)
+    if result:
+        return result
+    logger.warning("Jina Reader failed, falling back to local fetch.")
 
     return _fetch_urls_local(urls)
 
@@ -601,6 +606,41 @@ def _fetch_urls_tavily(urls: list[str], api_key: str) -> str:
     except Exception as e:
         logger.error("Tavily extract failed: %s", e)
         return ""
+
+
+def _fetch_urls_jina(urls: list[str]) -> str:
+    """
+    Fetches URL content via Jina Reader (r.jina.ai).
+
+    Free tier: 1000 requests/month, no API key required.
+    Returns clean markdown content extracted by Jina's AI parser.
+    Returns empty string on failure (caller should fall back).
+    """
+    import requests as _requests
+
+    formatted = []
+    for url in urls:
+        try:
+            resp = _requests.get(
+                f"https://r.jina.ai/{url}",
+                headers={
+                    "Accept": "text/markdown",
+                    "X-No-Cache": "true",
+                },
+                timeout=URL_FETCH_TIMEOUT,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                content = resp.text.strip()[:MAX_CHARS_PER_FILE]
+                formatted.append(f"[Fetched: {url}]\n{content}")
+            else:
+                logger.warning(
+                    "Jina Reader returned status %d for %s",
+                    resp.status_code, url,
+                )
+        except Exception as e:
+            logger.error("Jina Reader failed for %s: %s", url, e)
+
+    return "\n\n---\n\n".join(formatted) if formatted else ""
 
 
 def _fetch_urls_local(urls: list[str]) -> str:
