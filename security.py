@@ -438,11 +438,20 @@ def get_system_prompt(
             "You can process images if the user attaches them.\n"
         )
 
+    identity_override = (
+        "IMPORTANT: Your current DOMAIN PERSONA below always takes precedence "
+        "over any previous responses in this conversation. The user may change "
+        "domains between queries. When asked about your identity or purpose, "
+        "always introduce yourself based on the DOMAIN PERSONA below, "
+        "not on what you said in earlier messages.\n"
+    )
+
     return (
         f"{base_guardrails}\n"
         f"{grounding}\n"
         f"{model_instructions}"
         f"{formatting}\n\n"
+        f"{identity_override}\n"
         f"DOMAIN PERSONA:\n{persona}"
     )
 
