@@ -1182,16 +1182,24 @@ def multimodal_query(
 #  Document Processing Utilities
 # ═══════════════════════════════════════════════════════════════
 
-def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str:
+def extract_text_from_file(
+    file_obj,
+    max_chars: int = MAX_CHARS_PER_FILE,
+    api_key: str | None = None,
+) -> str:
     """
     Extracts plain text from an uploaded file object (PDF or TXT).
 
-    For PDFs, uses PyPDF2 to iterate pages and concatenate extracted text.
-    For TXT files, decodes as UTF-8 with fallback for encoding errors.
+    Strategy:
+      1. pypdf extracts text from text-based PDFs (fast, zero API calls).
+      2. If no text is found (scanned/image PDF), pymupdf renders pages
+         to images and Gemini Vision API performs OCR — zero local models.
+      3. For TXT files, decodes as UTF-8 with fallback for encoding errors.
 
     Args:
         file_obj: A Streamlit UploadedFile object.
         max_chars: Maximum characters to extract (safety limit).
+        api_key: Google API key for Gemini Vision OCR fallback.
 
     Returns:
         Extracted text string, or empty string on failure.
@@ -1200,6 +1208,7 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
 
     try:
         if name.endswith(".pdf"):
+            # Stage 1: Try text extraction with pypdf
             try:
                 from pypdf import PdfReader
             except ImportError:
@@ -1214,13 +1223,15 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
                     if len(text) > max_chars:
                         break
 
-            if not text.strip():
-                logger.warning(
-                    "PDF '%s' yielded no text (%d pages). "
-                    "File may be image-based (scanned) — OCR is required "
-                    "but not supported in this prototype.",
+            # Stage 2: If no text (scanned PDF), use Gemini Vision OCR
+            if not text.strip() and api_key:
+                logger.info(
+                    "PDF '%s' has no extractable text (%d pages). "
+                    "Attempting Gemini Vision OCR...",
                     file_obj.name, len(reader.pages),
                 )
+                text = _ocr_pdf_with_gemini(file_obj, api_key, max_chars)
+
             return text[:max_chars].strip()
 
         elif name.endswith(".txt"):
@@ -1233,6 +1244,82 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
 
     except Exception as e:
         logger.error("File extraction failed for %s: %s", name, e)
+        return ""
+
+
+def _ocr_pdf_with_gemini(
+    file_obj, api_key: str, max_chars: int
+) -> str:
+    """
+    Renders PDF pages to images via pymupdf and sends them to
+    Gemini Vision API for text extraction. Zero local OCR models.
+
+    Processes up to 10 pages to stay within Gemini's context limits
+    and keep API latency reasonable (~2-5s per page).
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        logger.error("pymupdf not installed — cannot OCR scanned PDFs")
+        return ""
+
+    try:
+        from google import genai
+    except ImportError:
+        logger.error("google-genai not installed — cannot OCR scanned PDFs")
+        return ""
+
+    try:
+        # Reset file pointer
+        file_obj.seek(0)
+        doc = pymupdf.open(stream=file_obj.read(), filetype="pdf")
+        pages_to_process = min(len(doc), 10)
+
+        logger.info(
+            "Rendering %d/%d pages for Gemini Vision OCR...",
+            pages_to_process, len(doc),
+        )
+
+        images = []
+        for i in range(pages_to_process):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            images.append(img_bytes)
+        doc.close()
+
+        client = genai.Client(api_key=api_key)
+
+        # Build multimodal prompt
+        parts = [
+            "Extract ALL text from these PDF page images. "
+            "Preserve the original structure: paragraphs, headings, "
+            "lists, and code blocks. Return only the extracted text, "
+            "no commentary."
+        ]
+        for img_bytes in images:
+            import base64
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(img_bytes).decode(),
+                }
+            })
+
+        response = client.models.generate_content(
+            model=PRIMARY_LLM_MODEL,
+            contents=parts,
+        )
+        text = response.text if hasattr(response, "text") else str(response)
+
+        logger.info(
+            "Gemini Vision OCR extracted %d chars from %d pages",
+            len(text), pages_to_process,
+        )
+        return text
+
+    except Exception as e:
+        logger.error("Gemini Vision OCR failed: %s", e)
         return ""
 
 
