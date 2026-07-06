@@ -257,12 +257,14 @@ with st.sidebar:
 
     kb: HybridKnowledgeBase = st.session_state.kb
 
-    # Display KB statistics
-    col_stat1, col_stat2 = st.columns(2)
-    with col_stat1:
-        st.metric(label="Chunks", value=kb.chunk_count)
-    with col_stat2:
-        st.metric(label="Sources", value=kb.source_count)
+    # Display KB statistics (placeholder updated after processing)
+    kb_stats_placeholder = st.empty()
+    with kb_stats_placeholder.container():
+        col_stat1, col_stat2 = st.columns(2)
+        with col_stat1:
+            st.metric(label="Chunks", value=kb.chunk_count)
+        with col_stat2:
+            st.metric(label="Sources", value=kb.source_count)
 
     # Show source files if any exist
     if kb.source_names:
@@ -351,9 +353,13 @@ with st.sidebar:
                     f"Added {total_chunks} chunks from "
                     f"{total_files} file(s) to the knowledge base."
                 )
-                # Clear uploader state so next rerun doesn't reprocess
-                st.session_state.pop("kb_uploader", None)
-                st.rerun()
+                # Refresh sidebar metrics immediately
+                with kb_stats_placeholder.container():
+                    col_stat1, col_stat2 = st.columns(2)
+                    with col_stat1:
+                        st.metric(label="Chunks", value=kb.chunk_count)
+                    with col_stat2:
+                        st.metric(label="Sources", value=kb.source_count)
             else:
                 st.error(
                     "No text could be extracted from the uploaded files. "
@@ -421,8 +427,14 @@ with st.sidebar:
                             f"Fetched and indexed {count} chunks from "
                             f"{len(valid_urls)} URL(s)."
                         )
+                        # Refresh sidebar metrics immediately
+                        with kb_stats_placeholder.container():
+                            col_stat1, col_stat2 = st.columns(2)
+                            with col_stat1:
+                                st.metric(label="Chunks", value=kb.chunk_count)
+                            with col_stat2:
+                                st.metric(label="Sources", value=kb.source_count)
                         st.session_state.pop("url_input_area", None)
-                        st.rerun()
                     else:
                         st.warning(
                             "URL content was fetched but produced no "

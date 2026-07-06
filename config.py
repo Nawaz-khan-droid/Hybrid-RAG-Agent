@@ -47,9 +47,9 @@ VISION_CAPABLE_MODELS: list[str] = [
     "gemini-3.1-pro-preview-customtools",
     # 3.x flash variants (likely vision)
     "gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image-preview",
     "gemini-3.1-flash-image",
+    # Image-specific
     "gemini-3.1-flash-lite-image",
     # Image-specific
     "gemini-3-pro-image-preview",

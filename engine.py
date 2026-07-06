@@ -455,11 +455,13 @@ class HybridKnowledgeBase:
                 results.append(f"[Source: {source}]\n{self.corpus[i]}")
 
         if not results:
-            return (
-                "No relevant documents found for the given query "
-                "and domain filter. Try adjusting your search "
-                "parameters or uploading relevant documents."
-            )
+            # Fallback: return most recent chunks so the agent has context
+            fallback = []
+            for i in range(min(3, len(self.corpus))):
+                idx = len(self.corpus) - 1 - i
+                source = self.metadata[idx].get("source", "Unknown")
+                fallback.append(f"[Source: {source}]\n{self.corpus[idx]}")
+            return "\n\n---\n\n".join(fallback)
 
         return "\n\n---\n\n".join(results)
 
