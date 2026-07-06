@@ -1182,6 +1182,12 @@ def multimodal_query(
 #  Document Processing Utilities
 # ═══════════════════════════════════════════════════════════════
 
+# Module-level OCR diagnostic (cleared before each extraction)
+_ocr_diagnostics: list[str] = []
+
+def get_ocr_diagnostics() -> list[str]:
+    return list(_ocr_diagnostics)
+
 def extract_text_from_file(
     file_obj,
     max_chars: int = MAX_CHARS_PER_FILE,
@@ -1204,6 +1210,7 @@ def extract_text_from_file(
     Returns:
         Extracted text string, or empty string on failure.
     """
+    _ocr_diagnostics.clear()
     name = file_obj.name.lower()
 
     try:
@@ -1259,15 +1266,19 @@ def _ocr_pdf_with_gemini(
     """
     try:
         import pymupdf
-    except ImportError:
-        logger.error("pymupdf not installed — cannot OCR scanned PDFs")
+    except ImportError as e:
+        msg = f"pymupdf not installed: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
         return ""
 
     try:
         from google import genai
         from google.genai import types
-    except ImportError:
-        logger.error("google-genai not installed — cannot OCR scanned PDFs")
+    except ImportError as e:
+        msg = f"google-genai not installed: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
         return ""
 
     try:
@@ -1321,7 +1332,9 @@ def _ocr_pdf_with_gemini(
         return text
 
     except Exception as e:
-        logger.error("Gemini Vision OCR failed: %s", e)
+        msg = f"Gemini Vision OCR failed: {type(e).__name__}: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
         return ""
 
 
