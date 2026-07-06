@@ -306,7 +306,7 @@ with st.sidebar:
                     st.warning(f"Validation failed for {file.name}: {reason}")
                     continue
 
-                text = extract_text_from_file(file)
+                text = extract_text_from_file(file, api_key=API_KEY)
                 if not text:
                     st.warning(f"Could not extract text from: {file.name}")
                     continue
