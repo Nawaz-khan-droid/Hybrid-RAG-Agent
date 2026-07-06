@@ -25,6 +25,11 @@ FALLBACK_LLM_MODEL: str = "gemini-2.0-flash"
 # Alias for backward-compatible access
 LLM_MODEL: str = PRIMARY_LLM_MODEL
 
+# Current date for web search recency context
+# Injected into system prompts so the agent searches for fresh results.
+from datetime import date
+CURRENT_DATE: str = date.today().isoformat()  # e.g. "2026-07-06"
+
 # Models known to support image/vision input
 # These are tried first when the query includes an image.
 VISION_CAPABLE_MODELS: list[str] = [

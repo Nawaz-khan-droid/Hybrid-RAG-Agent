@@ -72,6 +72,7 @@ from config import (
     TEXT_MODEL_CANDIDATES,
     VISION_MODEL_CANDIDATES,
     OCR_DPI,
+    CURRENT_DATE,
     is_vision_model,
 )
 
@@ -624,6 +625,9 @@ def _web_search_ddg(query: str, max_results: int) -> str:
     Web search via DuckDuckGo (ddgs package). Returns title,
     URL, and snippet for each result.
 
+    Uses timediff='w' (past week) to favor fresh results.
+    Falls back to no time filter if the parameter is unsupported.
+
     DDG returns only short snippets (~150 chars). For full page
     content, use fetch_url_content() with each result URL.
 
@@ -638,7 +642,11 @@ def _web_search_ddg(query: str, max_results: int) -> str:
 
     try:
         ddgs_client = DDGS()
-        results = ddgs_client.text(query, max_results=max_results)
+        try:
+            results = ddgs_client.text(query, max_results=max_results, timediff="w")
+        except TypeError:
+            # Older ddgs version without timediff support
+            results = ddgs_client.text(query, max_results=max_results)
 
         if not results:
             return f"No web search results found for: {query}"
@@ -927,6 +935,8 @@ def _build_react_conversation(
 
 You have access to the following tools:
 {tool_listing}
+
+Current date: {CURRENT_DATE}. When searching the web, include the current year or date in your search query to get fresh results.
 
 Use the following format strictly:
 
