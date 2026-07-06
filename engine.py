@@ -275,7 +275,7 @@ def _first_working_model(
 class HybridKnowledgeBase:
     """
     Manages a dual-index knowledge base that combines:
-      - FAISS IndexFlatL2 for semantic (vector) similarity search
+      - FAISS IndexFlatIP (inner product, normalized vectors → cosine similarity)
       - BM25Okapi for lexical (keyword) search
 
     Both indices are updated in-place when new documents are added,
