@@ -1479,6 +1479,7 @@ def _ocr_pdf_with_gemini(
                 types.Part.from_bytes(data=img, mime_type="image/png")
             )
 
+
         # Find a working vision model from cache; test if needed
         ocr_model = _first_working_model(
             VISION_MODEL_CANDIDATES,
