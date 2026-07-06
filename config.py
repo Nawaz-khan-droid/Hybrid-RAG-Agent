@@ -88,8 +88,13 @@ TEXT_MODEL_CANDIDATES: list[str] = [
 VISION_MODEL_CANDIDATES: list[str] = [
     "gemini-2.0-flash",           # fastest vision model
     "gemini-2.5-flash",           # newer, good quality
+    "gemini-3.1-flash-lite-image", # fresh quota pool, good OCR
     "gemini-2.0-flash-001",       # alternate variant
 ]
+
+# OCR rendering resolution (DPI). Higher = better text recognition
+# but larger image payloads. 200 is a good balance for scanned docs.
+OCR_DPI: int = 200
 
 # Low temperature for deterministic, factual responses
 LLM_TEMPERATURE: float = 0.1

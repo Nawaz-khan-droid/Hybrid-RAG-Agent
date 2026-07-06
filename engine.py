@@ -70,6 +70,7 @@ from config import (
     MODE_DIRECT,
     TEXT_MODEL_CANDIDATES,
     VISION_MODEL_CANDIDATES,
+    OCR_DPI,
     is_vision_model,
 )
 
@@ -1416,14 +1417,16 @@ def _ocr_pdf_with_gemini(
     file_obj, api_key: str, max_chars: int
 ) -> str:
     """
-    Renders PDF pages to images via pymupdf and sends them to
-    Gemini Vision API for text extraction. Zero local OCR models.
+    Renders each PDF page to an image at high DPI, then sends each page
+    individually to Gemini Vision API for text extraction.
 
-    Tries vision-capable models in order until one succeeds.
-    Uses the model registry cache to skip rate-limited models.
+    Page-by-page processing (instead of bulk) means:
+      - If one page fails, the rest still produce chunks
+      - Each API call has a smaller payload (faster, less token usage)
+      - The model can focus on one page at a time for better accuracy
 
-    Processes up to 10 pages to stay within Gemini's context limits
-    and keep API latency reasonable (~2-5s per page).
+    Uses the model registry to test + cache model availability,
+    and falls back to the next candidate if the current model fails.
     """
     try:
         import pymupdf
@@ -1443,44 +1446,27 @@ def _ocr_pdf_with_gemini(
         return ""
 
     try:
-        # Reset file pointer
         file_obj.seek(0)
         doc = pymupdf.open(stream=file_obj.read(), filetype="pdf")
-        pages_to_process = min(len(doc), 10)
+        total_pages = len(doc)
+        pages_to_process = min(total_pages, 10)
 
         logger.info(
-            "Rendering %d/%d pages for Gemini Vision OCR...",
-            pages_to_process, len(doc),
+            "Rendering %d/%d pages at %d DPI for Gemini OCR...",
+            pages_to_process, total_pages, OCR_DPI,
         )
 
-        images = []
+        # Render all pages to PNG images at high DPI
+        page_images: list[bytes] = []
         for i in range(pages_to_process):
             page = doc[i]
-            pix = page.get_pixmap(dpi=100)
-            img_bytes = pix.tobytes("png")
-            images.append(img_bytes)
+            pix = page.get_pixmap(dpi=OCR_DPI)
+            page_images.append(pix.tobytes("png"))
         doc.close()
 
         client = genai.Client(api_key=api_key)
 
-        # Build multimodal prompt
-        parts = [
-            types.Part.from_text(
-                text=(
-                    "Extract ALL text from these PDF page images. "
-                    "Preserve the original structure: paragraphs, headings, "
-                    "lists, and code blocks. Return only the extracted text, "
-                    "no commentary."
-                )
-            ),
-        ]
-        for img in images:
-            parts.append(
-                types.Part.from_bytes(data=img, mime_type="image/png")
-            )
-
-
-        # Find a working vision model from cache; test if needed
+        # Find a working vision model
         ocr_model = _first_working_model(
             VISION_MODEL_CANDIDATES,
             api_key,
@@ -1496,56 +1482,68 @@ def _ocr_pdf_with_gemini(
             _ocr_diagnostics.append(msg)
             return ""
 
-        try:
-            response = _invoke_with_retry(
-                lambda m=ocr_model: client.models.generate_content(
-                    model=m, contents=parts,
-                ),
-                service=f"gemini-ocr-{ocr_model}",
-            )
-            text = response.text if hasattr(response, "text") else str(response)
-            if text.strip():
-                logger.info("Gemini OCR extracted %d chars using %s", len(text), ocr_model)
-                return text
-            logger.warning("Gemini OCR returned empty text from %s", ocr_model)
-        except APIError as e:
-            logger.warning("OCR model %s failed: %s", ocr_model, e)
-            _ocr_diagnostics.append(f"Model {ocr_model}: {e}")
-            _model_status[ocr_model] = "rate_limited" if _is_rate_limit(e) else "unavailable"
-            # Fallback: try remaining vision models
-            remaining = [m for m in VISION_MODEL_CANDIDATES if m != ocr_model and _model_status.get(m) != "rate_limited"]
-            for model in remaining:
-                try:
-                    response = _invoke_with_retry(
-                        lambda m=model: client.models.generate_content(
-                            model=m, contents=parts,
-                        ),
-                        service=f"gemini-ocr-{model}",
-                    )
-                    text = response.text if hasattr(response, "text") else str(response)
-                    if text.strip():
-                        logger.info("Gemini OCR extracted %d chars using %s", len(text), model)
-                        return text
-                    logger.warning("Gemini OCR returned empty text from %s", model)
-                except APIError as e2:
-                    logger.warning("OCR model %s failed: %s", model, e2)
-                    _ocr_diagnostics.append(f"Model {model}: {e2}")
-                    _model_status[model] = "rate_limited" if _is_rate_limit(e2) else "unavailable"
-                    continue
-                except Exception as e2:
-                    logger.warning("OCR model %s unexpected error: %s", model, e2)
-                    _ocr_diagnostics.append(f"Model {model} error: {type(e2).__name__}: {e2}")
-                    _model_status[model] = "unavailable"
-                    continue
+        all_text_parts: list[str] = []
+        model_tried = ocr_model
+        candidate_pool = list(VISION_MODEL_CANDIDATES)
 
-        msg = (
-            "All OCR models exhausted. Enable a vision-capable model "
-            "(e.g. gemini-2.5-flash) in your Google API "
-            "console: https://ai.google.dev/gemini-api/docs/models"
-        )
-        logger.error(msg)
-        _ocr_diagnostics.append(msg)
-        return ""
+        for page_idx, img_bytes in enumerate(page_images):
+            # If current model was rate-limited, find next
+            if _model_status.get(model_tried) in ("rate_limited", "unavailable"):
+                remaining = [m for m in candidate_pool if _model_status.get(m) != "rate_limited" and _model_status.get(m) != "unavailable"]
+                if remaining:
+                    model_tried = remaining[0]
+                else:
+                    logger.warning("All models exhausted after page %d", page_idx)
+                    break
+
+            prompt = types.Part.from_text(
+                text=(
+                    f"Extract ALL text from page {page_idx+1} of {pages_to_process}. "
+                    "Preserve the original structure: paragraphs, headings, "
+                    "lists, and code blocks. Return only the extracted text, "
+                    "no commentary."
+                )
+            )
+            image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+
+            try:
+                response = _invoke_with_retry(
+                    lambda m=model_tried: client.models.generate_content(
+                        model=m, contents=[prompt, image_part],
+                    ),
+                    service=f"gemini-ocr-{model_tried}",
+                )
+                page_text = response.text if hasattr(response, "text") else str(response)
+                if page_text.strip():
+                    all_text_parts.append(page_text.strip())
+                    logger.info(
+                        "Page %d: extracted %d chars using %s",
+                        page_idx + 1, len(page_text), model_tried,
+                    )
+                else:
+                    logger.warning("Page %d: empty text from %s", page_idx + 1, model_tried)
+            except APIError as e:
+                logger.warning("Page %d failed on %s: %s", page_idx + 1, model_tried, e)
+                _ocr_diagnostics.append(f"Page {page_idx+1} on {model_tried}: {e}")
+                if _is_rate_limit(e):
+                    _model_status[model_tried] = "rate_limited"
+                else:
+                    _model_status[model_tried] = "unavailable"
+            except Exception as e:
+                logger.warning("Page %d unexpected error on %s: %s", page_idx + 1, model_tried, e)
+                _ocr_diagnostics.append(f"Page {page_idx+1} error: {type(e).__name__}")
+
+        combined = "\n\n".join(all_text_parts)
+        if combined:
+            logger.info(
+                "OCR complete: %d chars from %d/%d pages using %s",
+                len(combined), len(all_text_parts), pages_to_process, ocr_model,
+            )
+        else:
+            logger.warning("OCR produced no text from any page")
+            _ocr_diagnostics.append("OCR returned empty for all pages")
+
+        return combined[:max_chars]
 
     except Exception as e:
         msg = f"Gemini Vision OCR setup failed: {type(e).__name__}: {e}"
