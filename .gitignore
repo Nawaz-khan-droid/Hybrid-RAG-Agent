@@ -2,8 +2,16 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Streamlit secrets (NEVER commit actual API keys)
+# Secrets and credentials (NEVER commit actual API keys)
 .streamlit/secrets.toml
+**/secrets.toml
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+**/credentials.json
+service-account.json
 
 # FAISS index files
 *.index

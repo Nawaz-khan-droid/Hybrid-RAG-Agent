@@ -1001,14 +1001,10 @@ def _parse_action(text: str) -> tuple[Optional[str], Optional[str]]:
     tool_name = action_match.group(1).strip()
 
     # Extract action input from "Action Input: ..."
-    input_match = re.search(r"Action Input:\s*(.+)", text, re.DOTALL)
+    input_match = re.search(r"Action Input:\s*(.+?)(?=\n\s*(?:Observation:|Thought:|Action:|Final Answer:)|\Z)", text, re.DOTALL)
     if not input_match:
         return tool_name, None
     action_input = input_match.group(1).strip()
-    # Take only the first line (ignore anything after a newline)
-    action_input = action_input.split("\n")[0].strip()
-    # Remove any trailing "Observation:" if the LLM generated it
-    action_input = action_input.split("Observation:")[0].strip()
 
     return tool_name, action_input
 
@@ -1159,9 +1155,14 @@ def query_agent(
         # Parse Action and Action Input
         tool_name, action_input = _parse_action(text)
 
-        if tool_name and action_input:
-            # Look up the tool in the registry
-            if tool_name not in tools:
+        if tool_name:
+            if not action_input:
+                # Empty action input — tell the LLM to provide a query
+                observation = (
+                    "Error: Action Input cannot be empty. "
+                    "Please provide a search query or command after 'Action Input:'."
+                )
+            elif tool_name not in tools:
                 # Unknown tool — feed error back as observation
                 valid_tools = ", ".join(tools.keys())
                 observation = (
@@ -1191,8 +1192,16 @@ Observation: {observation}
 
 Thought:"""
         else:
-            # No structured output detected; return as-is
-            break
+            # No structured action detected — tell the LLM to follow the format
+            observation = (
+                "Error: Your response did not follow the required format. "
+                "Use 'Action: <tool_name>' and 'Action Input: <query>' to use a tool, "
+                "or 'Final Answer: <answer>' to provide your final answer."
+            )
+            conversation += f"""{text}
+Observation: {observation}
+
+Thought:"""
 
     # Fallback: return whatever the LLM produced in the last iteration
     return validate_output(last_text)
