@@ -135,8 +135,8 @@ DEFAULT_TOP_K: int = 8
 DEFAULT_ALPHA: float = 0.5
 
 # Text chunking parameters for document ingestion
-CHUNK_SIZE: int = 2000
-CHUNK_OVERLAP: int = 200
+CHUNK_SIZE: int = 1000
+CHUNK_OVERLAP: int = 100
 
 # Maximum characters to extract from a single file
 MAX_CHARS_PER_FILE: int = 500_000

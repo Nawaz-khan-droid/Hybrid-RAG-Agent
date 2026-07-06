@@ -1498,10 +1498,11 @@ def _ocr_pdf_with_gemini(
 
             prompt = types.Part.from_text(
                 text=(
-                    f"Extract ALL text from page {page_idx+1} of {pages_to_process}. "
-                    "Preserve the original structure: paragraphs, headings, "
-                    "lists, and code blocks. Return only the extracted text, "
-                    "no commentary."
+                    f"Transcribe ALL visible text from page {page_idx+1} of {pages_to_process} "
+                    "verbatim — every word, heading, list item, code line, and punctuation mark. "
+                    "Do NOT summarize, paraphrase, or omit anything. "
+                    "Preserve paragraphs and line breaks exactly as they appear. "
+                    "Return ONLY the raw transcribed text, no commentary."
                 )
             )
             image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/png")
@@ -1510,6 +1511,10 @@ def _ocr_pdf_with_gemini(
                 response = _invoke_with_retry(
                     lambda m=model_tried: client.models.generate_content(
                         model=m, contents=[prompt, image_part],
+                        config=types.GenerateContentConfig(
+                            max_output_tokens=8192,
+                            temperature=0.0,
+                        ),
                     ),
                     service=f"gemini-ocr-{model_tried}",
                 )
