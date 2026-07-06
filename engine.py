@@ -44,7 +44,6 @@ from langchain_google_genai import (
     GoogleGenerativeAIEmbeddings,
     ChatGoogleGenerativeAI,
 )
-from google.api_core.exceptions import ResourceExhausted
 
 from security import get_system_prompt, validate_output, sanitize_search_query
 from exceptions import APIError
@@ -134,11 +133,11 @@ def get_metrics_snapshot() -> dict[str, dict[str, float]]:
 
 def _tokenize(text: str) -> list[str]:
     """
-    Simple word-level tokenizer for BM25 indexing.
-    Splits on non-alphanumeric characters and lowercases.
-    Chosen over NLTK/spaCy to keep the dependency footprint minimal.
+    Word-level tokenizer for BM25 that preserves code symbols.
+    Keeps alphanumeric tokens AND non-whitespace symbols (->, ::, _, etc.)
+    so code-heavy documents (Python, JSON, configs) are searchable.
     """
-    return re.findall(r"\w+", text.lower())
+    return re.findall(r"\w+|[^\w\s]", text.lower())
 
 
 # ── Retry helper for Gemini API calls ──────────────────────
@@ -299,6 +298,7 @@ class HybridKnowledgeBase:
         self.bm25: Optional[BM25Okapi] = None
         self.corpus: list[str] = []
         self.metadata: list[dict] = []
+        self.tokenized_corpus: list[list[str]] = []  # cache for incremental BM25 rebuild
 
     # ── Properties ───────────────────────────────────────────
 
@@ -342,30 +342,45 @@ class HybridKnowledgeBase:
         self.corpus.extend(chunks)
         self.metadata.extend(metas)
 
-        # FAISS: embed and index directly (no langchain wrapper)
+        # FAISS: embed with retry + fallback model on persistent failure
         try:
             vectors = np.array(
-                self.embeddings.embed_documents(chunks), dtype=np.float32
+                _invoke_with_retry(
+                    lambda: self.embeddings.embed_documents(chunks),
+                    service="gemini-embed",
+                ),
+                dtype=np.float32,
             )
-        except ResourceExhausted:
+        except APIError:
             logger.warning(
-                "Embedding model %s quota exhausted, falling back to %s",
-                EMBEDDING_MODEL, FALLBACK_EMBEDDING_MODEL,
+                "Primary embedding model failed, falling back to %s",
+                FALLBACK_EMBEDDING_MODEL,
             )
             self.embeddings = GoogleGenerativeAIEmbeddings(
                 model=FALLBACK_EMBEDDING_MODEL,
                 google_api_key=self.api_key,
             )
             vectors = np.array(
-                self.embeddings.embed_documents(chunks), dtype=np.float32
+                _invoke_with_retry(
+                    lambda: self.embeddings.embed_documents(chunks),
+                    service="gemini-embed-fallback",
+                ),
+                dtype=np.float32,
             )
+
+        # Normalize vectors to unit length for cosine similarity (IndexFlatIP)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vectors = vectors / norms
+
         if self.vector_index is None:
-            self.vector_index = faiss.IndexFlatL2(vectors.shape[1])
+            self.vector_index = faiss.IndexFlatIP(vectors.shape[1])
         self.vector_index.add(vectors)
 
-        # BM25: full rebuild (BM25Okapi lacks incremental update)
-        tokenized_corpus = [_tokenize(doc) for doc in self.corpus]
-        self.bm25 = BM25Okapi(tokenized_corpus)
+        # BM25: tokenize only new chunks, then rebuild index
+        new_tokens = [_tokenize(chunk) for chunk in chunks]
+        self.tokenized_corpus.extend(new_tokens)
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
 
         logger.info("Added %d chunks. Total chunks: %d", len(chunks), self.chunk_count)
         return len(chunks)
@@ -385,8 +400,8 @@ class HybridKnowledgeBase:
 
         Score normalization:
           - BM25 raw scores are min-max normalized to [0, 1].
-          - FAISS L2 distances are converted to similarity via 1/(1+d)
-            and then min-max normalized to [0, 1].
+          - FAISS inner product (cosine similarity for normalized vectors)
+            is shifted from [-1, 1] to [0, 1] and min-max normalized.
 
         Domain filtering:
           - If a domain is specified and it is not "Custom/General",
@@ -410,25 +425,59 @@ class HybridKnowledgeBase:
         n = len(self.corpus)
 
         # ── 1. BM25 Keyword Scores ───────────────────────────
-        tokenized_query = _tokenize(query)
-        bm25_raw = np.array(
-            self.bm25.get_scores(tokenized_query), dtype=np.float64
-        )
-        bm25_max = bm25_raw.max()
-        bm25_norm = bm25_raw / bm25_max if bm25_max > 0 else np.zeros(n)
+        if self.bm25 is not None:
+            tokenized_query = _tokenize(query)
+            bm25_raw = np.array(
+                self.bm25.get_scores(tokenized_query), dtype=np.float64
+            )
+            bm25_max = bm25_raw.max()
+            bm25_norm = bm25_raw / bm25_max if bm25_max > 0 else np.zeros(n)
+        else:
+            bm25_norm = np.zeros(n)
 
         # ── 2. FAISS Vector Scores ───────────────────────────
         vector_norm = np.zeros(n, dtype=np.float64)
 
         if self.vector_index is not None:
-            query_vec = np.array(
-                self.embeddings.embed_query(query), dtype=np.float32
-            ).reshape(1, -1)
-            distances, indices = self.vector_index.search(query_vec, n)
-            for i in range(n):
+            # Embed query with retry + fallback model on persistent failure
+            try:
+                query_vec = np.array(
+                    _invoke_with_retry(
+                        lambda: self.embeddings.embed_query(query),
+                        service="gemini-embed-query",
+                    ),
+                    dtype=np.float32,
+                ).reshape(1, -1)
+            except APIError:
+                logger.warning(
+                    "Primary embedding model failed for query, falling back to %s",
+                    FALLBACK_EMBEDDING_MODEL,
+                )
+                self.embeddings = GoogleGenerativeAIEmbeddings(
+                    model=FALLBACK_EMBEDDING_MODEL,
+                    google_api_key=self.api_key,
+                )
+                query_vec = np.array(
+                    _invoke_with_retry(
+                        lambda: self.embeddings.embed_query(query),
+                        service="gemini-embed-query-fallback",
+                    ),
+                    dtype=np.float32,
+                ).reshape(1, -1)
+
+            # Normalize query vector to unit length
+            q_norm = np.linalg.norm(query_vec)
+            if q_norm > 0:
+                query_vec = query_vec / q_norm
+
+            # Bound search to top_k * 2 (not full scan)
+            search_k = min(n, top_k * 2)
+            distances, indices = self.vector_index.search(query_vec, search_k)
+            for i in range(search_k):
                 idx = indices[0][i]
                 if idx != -1:
-                    similarity = 1.0 / (1.0 + float(distances[0][i]))
+                    # For normalized vectors IndexFlatIP returns cosine sim in [-1, 1]
+                    similarity = (float(distances[0][i]) + 1.0) / 2.0
                     vector_norm[idx] = similarity
 
             v_max = vector_norm.max()
