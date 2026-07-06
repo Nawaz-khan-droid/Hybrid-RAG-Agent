@@ -59,6 +59,7 @@ from engine import (
     extract_text_from_file,
     chunk_text,
     get_metrics_snapshot,
+    get_ocr_diagnostics,
 )
 from security import (
     sanitize_input,
@@ -308,7 +309,19 @@ with st.sidebar:
 
                 text = extract_text_from_file(file, api_key=API_KEY)
                 if not text:
-                    st.warning(f"Could not extract text from: {file.name}")
+                    diag = get_ocr_diagnostics()
+                    if diag:
+                        st.error(f"Could not extract text from: {file.name}")
+                        for d in diag:
+                            st.caption(f"`{d}`")
+                        with st.expander("How to fix"):
+                            st.markdown(
+                                "**Scanned PDFs:** Ensure your API key is valid and has access to "
+                                "the `gemini-2.0-flash` vision model.\n\n"
+                                "**Text-based PDFs:** If this is a normal PDF, it may be corrupted."
+                            )
+                    else:
+                        st.warning(f"Could not extract text from: {file.name}")
                     continue
 
                 chunks = chunk_text(text)
