@@ -1265,6 +1265,7 @@ def _ocr_pdf_with_gemini(
 
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         logger.error("google-genai not installed — cannot OCR scanned PDFs")
         return ""
@@ -1290,24 +1291,23 @@ def _ocr_pdf_with_gemini(
 
         client = genai.Client(api_key=api_key)
 
-        # Build multimodal prompt
+        # Build multimodal prompt with proper Part objects
         parts = [
-            "Extract ALL text from these PDF page images. "
-            "Preserve the original structure: paragraphs, headings, "
-            "lists, and code blocks. Return only the extracted text, "
-            "no commentary."
+            types.Part.from_text(
+                "Extract ALL text from these PDF page images. "
+                "Preserve the original structure: paragraphs, headings, "
+                "lists, and code blocks. Return only the extracted text, "
+                "no commentary."
+            ),
         ]
-        for img_bytes in images:
-            import base64
-            parts.append({
-                "inline_data": {
-                    "mime_type": "image/png",
-                    "data": base64.b64encode(img_bytes).decode(),
-                }
-            })
+        for img in images:
+            parts.append(
+                types.Part.from_bytes(data=img, mime_type="image/png")
+            )
 
+        # Use gemini-2.0-flash — supports vision, unlike flash-lite
         response = client.models.generate_content(
-            model=PRIMARY_LLM_MODEL,
+            model=FALLBACK_LLM_MODEL,
             contents=parts,
         )
         text = response.text if hasattr(response, "text") else str(response)
