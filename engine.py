@@ -1200,7 +1200,10 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
 
     try:
         if name.endswith(".pdf"):
-            from PyPDF2 import PdfReader
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                from PyPDF2 import PdfReader
 
             reader = PdfReader(file_obj)
             text = ""
@@ -1210,6 +1213,14 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
                     text += page_text + "\n"
                     if len(text) > max_chars:
                         break
+
+            if not text.strip():
+                logger.warning(
+                    "PDF '%s' yielded no text (%d pages). "
+                    "File may be image-based (scanned) — OCR is required "
+                    "but not supported in this prototype.",
+                    file_obj.name, len(reader.pages),
+                )
             return text[:max_chars].strip()
 
         elif name.endswith(".txt"):
