@@ -549,9 +549,9 @@ def web_search(
         return "Search query is empty after sanitization."
 
     if provider == "ddg":
-        return _web_search_ddg(query, max_results)
+        result = _web_search_ddg(query, max_results)
 
-    if provider == "tavily":
+    elif provider == "tavily":
         if not tavily_api_key:
             return (
                 "Tavily web search requires an API key. "
@@ -561,13 +561,26 @@ def web_search(
         return _web_search_tavily(query, tavily_api_key, max_results)
 
     # "auto" mode: try Tavily first, fall back to DDG
-    if tavily_api_key:
+    elif tavily_api_key:
         result = _web_search_tavily(query, tavily_api_key, max_results)
         if not result.startswith("Web search failed"):
             return result
         logger.warning("Tavily search failed, falling back to DDG.")
+        result = _web_search_ddg(query, max_results)
 
-    return _web_search_ddg(query, max_results)
+    else:
+        result = _web_search_ddg(query, max_results)
+
+    # Enrich DDG results with full article content from top 2 URLs
+    if result and not result.startswith("No web search results") and not result.startswith("Web search failed"):
+        urls = re.findall(r'\]\(https?://[^)]+\)', result)
+        urls = [u[2:-1] for u in urls[:2]]
+        if urls:
+            full = fetch_url_content(urls, tavily_api_key)
+            if full and "No URLs provided" not in full and "Failed to fetch" not in full:
+                result += "\n\n---\n\n[Full article content extracted below]\n" + full
+
+    return result
 
 
 def _web_search_tavily(
@@ -955,6 +968,8 @@ IMPORTANT RULES:
 - Provide a concise search query after "Action Input:".
 - After receiving the Observation, decide if you need more information
   or if you can provide the Final Answer.
+- Always include the current date ({CURRENT_DATE}) in your answer,
+  for example: "As of July 6, 2026, ..."
 {extra_rules}
 
 Begin!
