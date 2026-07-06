@@ -1261,6 +1261,12 @@ def _ocr_pdf_with_gemini(
     Renders PDF pages to images via pymupdf and sends them to
     Gemini Vision API for text extraction. Zero local OCR models.
 
+    Tries vision-capable models in order until one succeeds:
+      1. PRIMARY_LLM_MODEL (gemini-2.5-flash-lite)
+      2. gemini-2.5-flash
+      3. FALLBACK_LLM_MODEL (gemini-2.0-flash)
+      4. gemini-1.5-flash
+
     Processes up to 10 pages to stay within Gemini's context limits
     and keep API latency reasonable (~2-5s per page).
     """
@@ -1302,7 +1308,7 @@ def _ocr_pdf_with_gemini(
 
         client = genai.Client(api_key=api_key)
 
-        # Build multimodal prompt with proper Part objects (keyword-only args)
+        # Build multimodal prompt
         parts = [
             types.Part.from_text(
                 text=(
@@ -1318,21 +1324,47 @@ def _ocr_pdf_with_gemini(
                 types.Part.from_bytes(data=img, mime_type="image/png")
             )
 
-        # Use gemini-2.0-flash — supports vision, unlike flash-lite
-        response = client.models.generate_content(
-            model=FALLBACK_LLM_MODEL,
-            contents=parts,
-        )
-        text = response.text if hasattr(response, "text") else str(response)
+        # Try models in order until one works
+        ocr_models = [
+            PRIMARY_LLM_MODEL,       # gemini-2.5-flash-lite
+            "gemini-2.5-flash",
+            FALLBACK_LLM_MODEL,      # gemini-2.0-flash
+            "gemini-1.5-flash",
+        ]
 
-        logger.info(
-            "Gemini Vision OCR extracted %d chars from %d pages",
-            len(text), pages_to_process,
+        for model in ocr_models:
+            try:
+                response = _invoke_with_retry(
+                    lambda m=model: client.models.generate_content(
+                        model=m, contents=parts,
+                    ),
+                    service=f"gemini-ocr-{model}",
+                )
+                text = response.text if hasattr(response, "text") else str(response)
+                if text.strip():
+                    logger.info("Gemini OCR extracted %d chars using %s", len(text), model)
+                    return text
+                logger.warning("Gemini OCR returned empty text from %s", model)
+            except APIError as e:
+                logger.warning("OCR model %s failed: %s", model, e)
+                _ocr_diagnostics.append(f"Model {model}: {e}")
+                continue
+            except Exception as e:
+                logger.warning("OCR model %s unexpected error: %s", model, e)
+                _ocr_diagnostics.append(f"Model {model} error: {type(e).__name__}: {e}")
+                continue
+
+        msg = (
+            "All OCR models exhausted. Enable a vision-capable model "
+            "(gemini-2.5-flash or gemini-2.0-flash) in your Google API "
+            "console: https://ai.google.dev/gemini-api/docs/models"
         )
-        return text
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
+        return ""
 
     except Exception as e:
-        msg = f"Gemini Vision OCR failed: {type(e).__name__}: {e}"
+        msg = f"Gemini Vision OCR setup failed: {type(e).__name__}: {e}"
         logger.error(msg)
         _ocr_diagnostics.append(msg)
         return ""
