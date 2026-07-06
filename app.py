@@ -312,13 +312,17 @@ with st.sidebar:
                     diag = get_ocr_diagnostics()
                     if diag:
                         st.error(f"Could not extract text from: {file.name}")
-                        for d in diag:
+                        for d in diag[-3:]:
                             st.caption(f"`{d}`")
                         with st.expander("How to fix"):
                             st.markdown(
-                                "**Scanned PDFs:** Ensure your API key is valid and has access to "
-                                "the `gemini-2.0-flash` vision model.\n\n"
-                                "**Text-based PDFs:** If this is a normal PDF, it may be corrupted."
+                                "**Quota exhausted:** Enable a vision-capable model "
+                                "(e.g. `gemini-2.5-flash`) at "
+                                "https://ai.google.dev/gemini-api/docs/models\n\n"
+                                "**Scanned PDF:** The file may be image-based. "
+                                "OCR requires a Gemini model with vision support.\n\n"
+                                "**Text-based PDF:** If this is a normal PDF, "
+                                "it may be corrupted or encrypted."
                             )
                     else:
                         st.warning(f"Could not extract text from: {file.name}")
