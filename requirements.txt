@@ -6,6 +6,11 @@
 # NOTE: langchain.agents and langchain.chains are intentionally NOT
 # listed here. The ReAct agent loop uses a manual tool registry
 # in engine.py, avoiding pydantic crashes on Python 3.14+.
+#
+# NOTE: tavily-python is NOT listed here. The web search code
+# imports it inside try/except blocks and gracefully falls back
+# to DuckDuckGo (no API key needed). Install it separately if
+# you want Tavily search: pip install tavily-python
 
 # Core framework
 streamlit>=1.32.0,<2.0.0
@@ -22,12 +27,12 @@ rank-bm25>=0.2.2,<1.0.0
 # Google AI (embedding, LLM, multimodal vision)
 google-genai>=0.3.0,<2.0.0
 
-# Web search
-tavily-python>=0.5.0,<1.0.0
+# Web search — DuckDuckGo (free, no API key)
 ddgs>=9.0.0,<10.0.0
 
 # Document processing
-PyPDF2>=3.0.1,<4.0.0
+pypdf>=4.0.0,<6.0.0
+pymupdf>=1.25.0,<2.0.0
 
 # Image support
 pillow>=10.0.0,<12.0.0

@@ -68,6 +68,9 @@ from config import (
     MODE_WEB_ONLY,
     MODE_HYBRID,
     MODE_DIRECT,
+    TEXT_MODEL_CANDIDATES,
+    VISION_MODEL_CANDIDATES,
+    is_vision_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -200,8 +203,72 @@ def _invoke_with_retry(callable_fn, max_attempts=3, service="gemini"):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Hybrid Knowledge Base
+#  Model Registry — test + cache model availability
 # ═══════════════════════════════════════════════════════════════
+
+# Cache: model_name -> status ("ok" | "rate_limited" | "unavailable")
+_model_status: dict[str, str] = {}
+
+def _test_model(model: str, api_key: str) -> str:
+    """
+    Make a single minimal API call to check if a model is usable.
+    Caches the result so the model is only tested once per session.
+
+    Returns one of: "ok", "rate_limited", "unavailable".
+    """
+    if model in _model_status:
+        return _model_status[model]
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        _model_status[model] = "unavailable"
+        return "unavailable"
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents="Reply OK",
+            config=types.GenerateContentConfig(
+                max_output_tokens=1,
+                temperature=0.0,
+            ),
+        )
+        _model_status[model] = "ok"
+        return "ok"
+    except Exception as exc:
+        msg = str(exc).lower()
+        if _is_rate_limit(exc):
+            _model_status[model] = "rate_limited"
+            logger.info("Model %s is rate-limited, caching as unavailable", model)
+        else:
+            _model_status[model] = "unavailable"
+            logger.info("Model %s unavailable: %s", model, msg[:120])
+        return _model_status[model]
+
+
+def _first_working_model(
+    candidates: list[str],
+    api_key: str,
+    needs_vision: bool = False,
+) -> str | None:
+    """
+    Return the first model from *candidates* that:
+      - (if needs_vision) is in VISION_CAPABLE_MODELS
+      - passes the lightweight ping test (or was already proven ok)
+
+    Returns None when all models are exhausted.
+    """
+    if needs_vision:
+        candidates = [m for m in candidates if is_vision_model(m)]
+
+    for model in candidates:
+        status = _test_model(model, api_key)
+        if status == "ok":
+            return model
+    return None
 
 class HybridKnowledgeBase:
     """
@@ -536,10 +603,10 @@ def fetch_url_content(
     """
     Fetches and extracts text content from one or more URLs.
 
-    Uses Tavily's extract API which fetches and parses pages
-    server-side, avoiding SSRF risk on the Streamlit instance.
-    If Tavily is unavailable, falls back to a local HTTP fetcher
-    (with SSRF protections applied by the caller via validate_url).
+    Tries providers in order:
+      1. Tavily Extract (server-side, best quality, needs API key)
+      2. Jina Reader (free 1000 req/month, clean markdown, no key needed)
+      3. Local HTTP fetcher with regex HTML stripping (last resort)
 
     Args:
         urls: List of URL strings to fetch.
@@ -556,7 +623,12 @@ def fetch_url_content(
         result = _fetch_urls_tavily(urls, tavily_api_key)
         if result:
             return result
-        logger.warning("Tavily extract failed, falling back to local fetch.")
+        logger.warning("Tavily extract failed, trying Jina Reader.")
+
+    result = _fetch_urls_jina(urls)
+    if result:
+        return result
+    logger.warning("Jina Reader failed, falling back to local fetch.")
 
     return _fetch_urls_local(urls)
 
@@ -601,6 +673,41 @@ def _fetch_urls_tavily(urls: list[str], api_key: str) -> str:
     except Exception as e:
         logger.error("Tavily extract failed: %s", e)
         return ""
+
+
+def _fetch_urls_jina(urls: list[str]) -> str:
+    """
+    Fetches URL content via Jina Reader (r.jina.ai).
+
+    Free tier: 1000 requests/month, no API key required.
+    Returns clean markdown content extracted by Jina's AI parser.
+    Returns empty string on failure (caller should fall back).
+    """
+    import requests as _requests
+
+    formatted = []
+    for url in urls:
+        try:
+            resp = _requests.get(
+                f"https://r.jina.ai/{url}",
+                headers={
+                    "Accept": "text/markdown",
+                    "X-No-Cache": "true",
+                },
+                timeout=URL_FETCH_TIMEOUT,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                content = resp.text.strip()[:MAX_CHARS_PER_FILE]
+                formatted.append(f"[Fetched: {url}]\n{content}")
+            else:
+                logger.warning(
+                    "Jina Reader returned status %d for %s",
+                    resp.status_code, url,
+                )
+        except Exception as e:
+            logger.error("Jina Reader failed for %s: %s", url, e)
+
+    return "\n\n---\n\n".join(formatted) if formatted else ""
 
 
 def _fetch_urls_local(urls: list[str]) -> str:
@@ -712,20 +819,42 @@ def _build_react_conversation(
     system_prompt: str,
     tools: dict[str, str],
     query: str,
+    mode: str = MODE_KB_ONLY,
 ) -> str:
     """
     Builds the initial ReAct conversation string with the system
     prompt, tool listing, and the user's question.
 
     Args:
-        system_prompt: The mode-aware system prompt.
+        system_prompt: The mode- and model-aware system prompt.
         tools: Dict of {tool_name: tool_description}.
         query: The user's question.
+        mode: Search mode for mode-specific format instructions.
 
     Returns:
         The complete initial conversation string.
     """
     tool_listing = _build_tool_prompt(tools)
+
+    # Mode-specific format rules to avoid prompt conflicts
+    mode_rules = {
+        MODE_KB_ONLY: [
+            "You MUST search the knowledge base before providing a final answer.",
+            "Do not answer questions about uploaded documents from general knowledge alone.",
+        ],
+        MODE_WEB_ONLY: [
+            "You MUST search the web before providing a final answer.",
+            "Always cite source URLs for web-derived information.",
+        ],
+        MODE_HYBRID: [
+            "You MUST search the knowledge base before providing a final answer.",
+            "You may also search the web for supplementary information.",
+            "When information conflicts, prefer the knowledge base.",
+        ],
+    }
+    extra_rules = "\n".join(
+        f"- {r}" for r in mode_rules.get(mode, mode_rules[MODE_KB_ONLY])
+    )
 
     return f"""{system_prompt}
 
@@ -749,12 +878,13 @@ IMPORTANT RULES:
 - Provide a concise search query after "Action Input:".
 - After receiving the Observation, decide if you need more information
   or if you can provide the Final Answer.
+{extra_rules}
 
 Begin!
 
 Question: {query}
 
-Thought:"""
+Thought: I need to search first."""
 
 
 def _parse_action(text: str) -> tuple[Optional[str], Optional[str]]:
@@ -863,19 +993,29 @@ def query_agent(
             "No search tools are available in the current mode."
         )
 
-    # ── Initialize LLM with model fallback ─────────────────
+    # ── Find a working text model ─────────────────────────
+    text_model = _first_working_model(
+        TEXT_MODEL_CANDIDATES,
+        api_key,
+    )
+    if not text_model:
+        return validate_output(
+            "No AI model is currently available. All models are "
+            "rate-limited or unreachable. Please wait and try again."
+        )
+
     def _try_llm(model: str) -> ChatGoogleGenerativeAI:
         return ChatGoogleGenerativeAI(
             model=model, google_api_key=api_key, temperature=LLM_TEMPERATURE,
         )
 
-    llm = _try_llm(PRIMARY_LLM_MODEL)
-    system_prompt = get_system_prompt(domain, mode=mode)
+    llm = _try_llm(text_model)
+    system_prompt = get_system_prompt(domain, mode=mode, model=text_model)
 
     # Build tool descriptions dict for prompt generation
     tool_descriptions = {name: desc for name, (desc, _) in tools.items()}
     conversation = _build_react_conversation(
-        system_prompt, tool_descriptions, query
+        system_prompt, tool_descriptions, query, mode=mode
     )
 
     last_text = ""
@@ -885,19 +1025,31 @@ def query_agent(
             response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm")
             text = response.content if hasattr(response, "content") else str(response)
         except APIError as e:
-            if e.status_code == 429 and llm.model == PRIMARY_LLM_MODEL:
-                logger.warning("Rate limited on %s, falling back to %s", PRIMARY_LLM_MODEL, FALLBACK_LLM_MODEL)
+            if _is_rate_limit(e):
+                logger.warning("Rate limited on %s, searching for next model", llm.model)
                 _record_metric("primary_rate_limited", 1)
-                llm = _try_llm(FALLBACK_LLM_MODEL)
-                try:
-                    response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm-fallback")
-                    text = response.content if hasattr(response, "content") else str(response)
-                except APIError as e2:
-                    logger.error("Fallback LLM also failed: %s", e2)
-                    return "AI model is temporarily unavailable. Please wait a moment and try again."
-                except Exception as e2:
-                    logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
-                    return "An unexpected error occurred. Please try again."
+                _model_status[llm.model] = "rate_limited"
+                next_model = _first_working_model(
+                    TEXT_MODEL_CANDIDATES,
+                    api_key,
+                )
+                if next_model:
+                    llm = _try_llm(next_model)
+                    system_prompt = get_system_prompt(domain, mode=mode, model=next_model)
+                    conversation = _build_react_conversation(
+                        system_prompt, tool_descriptions, query, mode=mode
+                    )
+                    try:
+                        response = _invoke_with_retry(lambda: llm.invoke(conversation), service="gemini-llm-fallback")
+                        text = response.content if hasattr(response, "content") else str(response)
+                    except APIError as e2:
+                        logger.error("Fallback LLM also failed: %s", e2)
+                        return "AI model is temporarily unavailable. Please wait a moment and try again."
+                    except Exception as e2:
+                        logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
+                        return "An unexpected error occurred. Please try again."
+                else:
+                    return "All AI models are rate-limited. Please wait and try again."
             else:
                 logger.error("LLM failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
                 return f"The AI model is temporarily unavailable. Please try again in a few seconds."
@@ -983,8 +1135,18 @@ def direct_chat(
             model=model, google_api_key=api_key, temperature=LLM_TEMPERATURE,
         )
 
-    llm = _try_llm(PRIMARY_LLM_MODEL)
-    system_prompt = get_system_prompt(domain, mode=MODE_DIRECT)
+    text_model = _first_working_model(
+        TEXT_MODEL_CANDIDATES,
+        api_key,
+    )
+    if not text_model:
+        return validate_output(
+            "No AI model is currently available. All models are "
+            "rate-limited or unreachable. Please wait and try again."
+        )
+
+    llm = _try_llm(text_model)
+    system_prompt = get_system_prompt(domain, mode=MODE_DIRECT, model=text_model)
 
     # Build message list from recent chat history
     messages = [{"role": "system", "content": system_prompt}]
@@ -1002,20 +1164,30 @@ def direct_chat(
         text = response.content if hasattr(response, "content") else str(response)
         return validate_output(text)
     except APIError as e:
-        if e.status_code == 429 and llm.model == PRIMARY_LLM_MODEL:
-            logger.warning("Rate limited on %s, falling back to %s", PRIMARY_LLM_MODEL, FALLBACK_LLM_MODEL)
+        if _is_rate_limit(e):
+            logger.warning("Rate limited on %s, searching for next model", llm.model)
             _record_metric("primary_rate_limited", 1)
-            llm = _try_llm(FALLBACK_LLM_MODEL)
-            try:
-                response = _invoke_with_retry(lambda: llm.invoke(messages), service="gemini-chat-fallback")
-                text = response.content if hasattr(response, "content") else str(response)
-                return validate_output(text)
-            except APIError as e2:
-                logger.error("Fallback LLM also failed: %s", e2)
-                return "AI model is temporarily unavailable. Please wait a moment and try again."
-            except Exception as e2:
-                logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
-                return "An unexpected error occurred. Please try again."
+            _model_status[llm.model] = "rate_limited"
+            next_model = _first_working_model(
+                TEXT_MODEL_CANDIDATES,
+                api_key,
+            )
+            if next_model:
+                llm = _try_llm(next_model)
+                system_prompt = get_system_prompt(domain, mode=MODE_DIRECT, model=next_model)
+                messages[0] = {"role": "system", "content": system_prompt}
+                try:
+                    response = _invoke_with_retry(lambda: llm.invoke(messages), service="gemini-chat-fallback")
+                    text = response.content if hasattr(response, "content") else str(response)
+                    return validate_output(text)
+                except APIError as e2:
+                    logger.error("Fallback LLM also failed: %s", e2)
+                    return "AI model is temporarily unavailable. Please wait a moment and try again."
+                except Exception as e2:
+                    logger.error("Fallback LLM unexpected error: %s", e2, exc_info=True)
+                    return "An unexpected error occurred. Please try again."
+            else:
+                return "All AI models are rate-limited. Please wait and try again."
         else:
             logger.error("Direct chat failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
             return f"The AI model is temporarily unavailable. Please try again."
@@ -1071,7 +1243,6 @@ def multimodal_query(
         )
 
     client = genai.Client(api_key=api_key)
-    system_prompt = get_system_prompt(domain, mode=mode)
 
     # Build context section based on what was provided
     if context and "empty" not in context.lower() and "no relevant" not in context.lower():
@@ -1086,6 +1257,20 @@ def multimodal_query(
             "primarily on the image content.\n\n"
         )
 
+    # Determine the first model to try — must support vision
+    vision_model = _first_working_model(
+        VISION_MODEL_CANDIDATES,
+        api_key,
+        needs_vision=True,
+    )
+    if not vision_model:
+        return validate_output(
+            "No vision-capable AI model is currently available. "
+            "All models are rate-limited or unreachable."
+        )
+
+    system_prompt = get_system_prompt(domain, mode=mode, model=vision_model)
+
     full_prompt = (
         f"{system_prompt}\n\n"
         f"You are analyzing an image alongside available context. "
@@ -1099,7 +1284,7 @@ def multimodal_query(
     try:
         response = _invoke_with_retry(
             lambda: client.models.generate_content(
-                model=PRIMARY_LLM_MODEL,
+                model=vision_model,
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     full_prompt,
@@ -1109,32 +1294,45 @@ def multimodal_query(
         )
         return validate_output(response.text)
     except APIError as e:
-        if e.status_code == 429:
-            logger.warning("Rate limited on primary vision model, trying fallback %s", FALLBACK_LLM_MODEL)
+        if _is_rate_limit(e):
+            logger.warning("Rate limited on %s, searching for next vision model", vision_model)
             _record_metric("primary_rate_limited", 1)
-            try:
-                response = _invoke_with_retry(
-                    lambda: client.models.generate_content(
-                        model=FALLBACK_LLM_MODEL,
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                            full_prompt,
-                        ],
-                    ),
-                    service="gemini-vision-fallback",
-                )
-                return validate_output(response.text)
-            except APIError as e2:
-                logger.error("Fallback vision model also failed: %s", e2)
-                return "AI model is temporarily unavailable. Please wait a moment and try again."
-            except Exception as e2:
-                logger.error("Fallback vision unexpected error: %s", e2, exc_info=True)
-                return "An unexpected error occurred. Please try again."
+            _model_status[vision_model] = "rate_limited"
+            next_vision = _first_working_model(
+                VISION_MODEL_CANDIDATES,
+                api_key,
+                needs_vision=True,
+            )
+            if next_vision:
+                try:
+                    response = _invoke_with_retry(
+                        lambda: client.models.generate_content(
+                            model=next_vision,
+                            contents=[
+                                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                                full_prompt,
+                            ],
+                        ),
+                        service="gemini-vision-fallback",
+                    )
+                    return validate_output(response.text)
+                except APIError as e2:
+                    logger.error("Fallback vision model also failed: %s", e2)
+                    return "AI model is temporarily unavailable. Please wait a moment and try again."
+                except Exception as e2:
+                    logger.error("Fallback vision unexpected error: %s", e2, exc_info=True)
+                    return "An unexpected error occurred. Please try again."
+            else:
+                return "All vision AI models are rate-limited. Please wait and try again."
         else:
-            logger.error("Multimodal query failed: %s", e, extra={"api_service": e.service, "error_code": e.error_code})
+            logger.error(
+                "Multimodal query failed on %s: %s",
+                vision_model, e,
+                extra={"api_service": e.service, "error_code": e.error_code},
+            )
             return f"The AI model is temporarily unavailable. Please try again."
     except Exception as e:
-        logger.error("Multimodal query failed: %s", e, exc_info=True)
+        logger.error("Multimodal query failed on %s: %s", vision_model, e, exc_info=True)
         return f"An unexpected error occurred while processing your image query."
 
 
@@ -1142,25 +1340,44 @@ def multimodal_query(
 #  Document Processing Utilities
 # ═══════════════════════════════════════════════════════════════
 
-def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str:
+# Module-level OCR diagnostic (cleared before each extraction)
+_ocr_diagnostics: list[str] = []
+
+def get_ocr_diagnostics() -> list[str]:
+    return list(_ocr_diagnostics)
+
+def extract_text_from_file(
+    file_obj,
+    max_chars: int = MAX_CHARS_PER_FILE,
+    api_key: str | None = None,
+) -> str:
     """
     Extracts plain text from an uploaded file object (PDF or TXT).
 
-    For PDFs, uses PyPDF2 to iterate pages and concatenate extracted text.
-    For TXT files, decodes as UTF-8 with fallback for encoding errors.
+    Strategy:
+      1. pypdf extracts text from text-based PDFs (fast, zero API calls).
+      2. If no text is found (scanned/image PDF), pymupdf renders pages
+         to images and Gemini Vision API performs OCR — zero local models.
+      3. For TXT files, decodes as UTF-8 with fallback for encoding errors.
 
     Args:
         file_obj: A Streamlit UploadedFile object.
         max_chars: Maximum characters to extract (safety limit).
+        api_key: Google API key for Gemini Vision OCR fallback.
 
     Returns:
         Extracted text string, or empty string on failure.
     """
+    _ocr_diagnostics.clear()
     name = file_obj.name.lower()
 
     try:
         if name.endswith(".pdf"):
-            from PyPDF2 import PdfReader
+            # Stage 1: Try text extraction with pypdf
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                from PyPDF2 import PdfReader
 
             reader = PdfReader(file_obj)
             text = ""
@@ -1170,6 +1387,16 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
                     text += page_text + "\n"
                     if len(text) > max_chars:
                         break
+
+            # Stage 2: If no text (scanned PDF), use Gemini Vision OCR
+            if not text.strip() and api_key:
+                logger.info(
+                    "PDF '%s' has no extractable text (%d pages). "
+                    "Attempting Gemini Vision OCR...",
+                    file_obj.name, len(reader.pages),
+                )
+                text = _ocr_pdf_with_gemini(file_obj, api_key, max_chars)
+
             return text[:max_chars].strip()
 
         elif name.endswith(".txt"):
@@ -1182,6 +1409,147 @@ def extract_text_from_file(file_obj, max_chars: int = MAX_CHARS_PER_FILE) -> str
 
     except Exception as e:
         logger.error("File extraction failed for %s: %s", name, e)
+        return ""
+
+
+def _ocr_pdf_with_gemini(
+    file_obj, api_key: str, max_chars: int
+) -> str:
+    """
+    Renders PDF pages to images via pymupdf and sends them to
+    Gemini Vision API for text extraction. Zero local OCR models.
+
+    Tries vision-capable models in order until one succeeds.
+    Uses the model registry cache to skip rate-limited models.
+
+    Processes up to 10 pages to stay within Gemini's context limits
+    and keep API latency reasonable (~2-5s per page).
+    """
+    try:
+        import pymupdf
+    except ImportError as e:
+        msg = f"pymupdf not installed: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
+        return ""
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        msg = f"google-genai not installed: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
+        return ""
+
+    try:
+        # Reset file pointer
+        file_obj.seek(0)
+        doc = pymupdf.open(stream=file_obj.read(), filetype="pdf")
+        pages_to_process = min(len(doc), 10)
+
+        logger.info(
+            "Rendering %d/%d pages for Gemini Vision OCR...",
+            pages_to_process, len(doc),
+        )
+
+        images = []
+        for i in range(pages_to_process):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=100)
+            img_bytes = pix.tobytes("png")
+            images.append(img_bytes)
+        doc.close()
+
+        client = genai.Client(api_key=api_key)
+
+        # Build multimodal prompt
+        parts = [
+            types.Part.from_text(
+                text=(
+                    "Extract ALL text from these PDF page images. "
+                    "Preserve the original structure: paragraphs, headings, "
+                    "lists, and code blocks. Return only the extracted text, "
+                    "no commentary."
+                )
+            ),
+        ]
+        for img in images:
+            parts.append(
+                types.Part.from_bytes(data=img, mime_type="image/png")
+            )
+
+        # Find a working vision model from cache; test if needed
+        ocr_model = _first_working_model(
+            VISION_MODEL_CANDIDATES,
+            api_key,
+            needs_vision=True,
+        )
+        if not ocr_model:
+            msg = (
+                "No vision-capable model available for OCR. "
+                "Enable a vision model (e.g. gemini-2.0-flash) in "
+                "your Google API console."
+            )
+            logger.error(msg)
+            _ocr_diagnostics.append(msg)
+            return ""
+
+        try:
+            response = _invoke_with_retry(
+                lambda m=ocr_model: client.models.generate_content(
+                    model=m, contents=parts,
+                ),
+                service=f"gemini-ocr-{ocr_model}",
+            )
+            text = response.text if hasattr(response, "text") else str(response)
+            if text.strip():
+                logger.info("Gemini OCR extracted %d chars using %s", len(text), ocr_model)
+                return text
+            logger.warning("Gemini OCR returned empty text from %s", ocr_model)
+        except APIError as e:
+            logger.warning("OCR model %s failed: %s", ocr_model, e)
+            _ocr_diagnostics.append(f"Model {ocr_model}: {e}")
+            _model_status[ocr_model] = "rate_limited" if _is_rate_limit(e) else "unavailable"
+            # Fallback: try remaining vision models
+            remaining = [m for m in VISION_MODEL_CANDIDATES if m != ocr_model and _model_status.get(m) != "rate_limited"]
+            for model in remaining:
+                try:
+                    response = _invoke_with_retry(
+                        lambda m=model: client.models.generate_content(
+                            model=m, contents=parts,
+                        ),
+                        service=f"gemini-ocr-{model}",
+                    )
+                    text = response.text if hasattr(response, "text") else str(response)
+                    if text.strip():
+                        logger.info("Gemini OCR extracted %d chars using %s", len(text), model)
+                        return text
+                    logger.warning("Gemini OCR returned empty text from %s", model)
+                except APIError as e2:
+                    logger.warning("OCR model %s failed: %s", model, e2)
+                    _ocr_diagnostics.append(f"Model {model}: {e2}")
+                    _model_status[model] = "rate_limited" if _is_rate_limit(e2) else "unavailable"
+                    continue
+                except Exception as e2:
+                    logger.warning("OCR model %s unexpected error: %s", model, e2)
+                    _ocr_diagnostics.append(f"Model {model} error: {type(e2).__name__}: {e2}")
+                    _model_status[model] = "unavailable"
+                    continue
+
+        msg = (
+            "All OCR models exhausted. Enable a vision-capable model "
+            "(e.g. gemini-2.5-flash) in your Google API "
+            "console: https://ai.google.dev/gemini-api/docs/models"
+        )
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
+        return ""
+
+    except Exception as e:
+        msg = f"Gemini Vision OCR setup failed: {type(e).__name__}: {e}"
+        logger.error(msg)
+        _ocr_diagnostics.append(msg)
         return ""
 
 

@@ -27,6 +27,7 @@ Session state design:
 """
 
 import logging
+import os
 
 import streamlit as st
 
@@ -58,6 +59,7 @@ from engine import (
     extract_text_from_file,
     chunk_text,
     get_metrics_snapshot,
+    get_ocr_diagnostics,
 )
 from security import (
     sanitize_input,
@@ -89,39 +91,39 @@ st.set_page_config(
 
 def _load_api_key(secret_name: str, optional: bool = False) -> str | None:
     """
-    Loads an API key from Streamlit secrets.
+    Loads an API key from Streamlit secrets or environment variables.
+
+    Checks st.secrets first (Streamlit Cloud / local), then falls back
+    to os.environ (HuggingFace Spaces, Docker, etc.).
 
     Args:
-        secret_name: The key name in st.secrets.
+        secret_name: The key name.
         optional: If True, returns None instead of stopping the app
                   when the key is missing.
 
     Returns:
         The API key string, or None if optional and missing.
     """
+    key = None
     try:
         key = st.secrets[secret_name]
-        if not key or not key.strip():
-            raise ValueError("API key is empty")
+    except (KeyError, FileNotFoundError, Exception):
+        key = os.environ.get(secret_name)
+
+    if key and key.strip():
         return key.strip()
-    except KeyError:
-        if optional:
-            return None
-        st.error(
-            f"**{secret_name} not found in Streamlit secrets.**\n\n"
-            "To fix this:\n"
-            "1. Go to your Streamlit Cloud app dashboard.\n"
-            "2. Click **Settings** > **Secrets**.\n"
-            f"3. Add: {secret_name} = your_key_here\n"
-            "4. Redeploy the app."
-        )
-        st.stop()
-    except Exception as e:
-        if optional:
-            logger.warning("Error loading optional key %s: %s", secret_name, e)
-            return None
-        st.error(f"Error loading {secret_name}: {e}")
-        st.stop()
+
+    if optional:
+        return None
+    st.error(
+        f"**{secret_name} not found.**\n\n"
+        "Set it in one of:\n"
+        "- **Streamlit Cloud:** Settings > Secrets\n"
+        "- **HuggingFace Spaces:** Settings > Variables and secrets > Secrets\n"
+        "- **Local:** `.streamlit/secrets.toml` or environment variable\n"
+        f"Add: `{secret_name} = your_key_here`"
+    )
+    st.stop()
 
 
 API_KEY = _load_api_key("GOOGLE_API_KEY")
@@ -305,9 +307,25 @@ with st.sidebar:
                     st.warning(f"Validation failed for {file.name}: {reason}")
                     continue
 
-                text = extract_text_from_file(file)
+                text = extract_text_from_file(file, api_key=API_KEY)
                 if not text:
-                    st.warning(f"Could not extract text from: {file.name}")
+                    diag = get_ocr_diagnostics()
+                    if diag:
+                        st.error(f"Could not extract text from: {file.name}")
+                        for d in diag[-3:]:
+                            st.caption(f"`{d}`")
+                        with st.expander("How to fix"):
+                            st.markdown(
+                                "**Quota exhausted:** Enable a vision-capable model "
+                                "(e.g. `gemini-2.5-flash`) at "
+                                "https://ai.google.dev/gemini-api/docs/models\n\n"
+                                "**Scanned PDF:** The file may be image-based. "
+                                "OCR requires a Gemini model with vision support.\n\n"
+                                "**Text-based PDF:** If this is a normal PDF, "
+                                "it may be corrupted or encrypted."
+                            )
+                    else:
+                        st.warning(f"Could not extract text from: {file.name}")
                     continue
 
                 chunks = chunk_text(text)

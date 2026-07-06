@@ -21,11 +21,11 @@ from config import (
     FILE_MAGIC_BYTES,
     ALLOWED_URL_SCHEMES,
     BLOCKED_CIDR_RANGES,
-    URL_MAX_RESPONSE_BYTES,
     MODE_KB_ONLY,
     MODE_WEB_ONLY,
     MODE_HYBRID,
     MODE_DIRECT,
+    is_vision_model,
 )
 
 
@@ -299,20 +299,28 @@ def validate_file_magic(file_obj, extension: str) -> tuple[bool, str]:
 #  System Prompt Generation (Mode-Aware)
 # ═══════════════════════════════════════════════════════════════
 
-def get_system_prompt(domain: str, mode: str = MODE_KB_ONLY) -> str:
+def get_system_prompt(
+    domain: str,
+    mode: str = MODE_KB_ONLY,
+    model: str | None = None,
+) -> str:
     """
-    Returns a domain-specific and mode-specific system prompt with
-    embedded security guardrails.
+    Returns a domain-specific, mode-specific, and model-capability-aware
+    system prompt with embedded security guardrails.
 
-    The grounding instruction changes based on the search mode:
-      - kb_only: Answers MUST be based only on KB context.
-      - web_only: Answers are based on web search results.
-      - hybrid:   Answers combine KB context and web results.
-      - direct:   Answers use the model's built-in knowledge.
+    The prompt adapts to three factors:
+      - Mode (kb_only / web_only / hybrid / direct) — controls retrieval
+        and grounding behavior.
+      - Model capability (vision vs. text-only) — controls whether
+        image handling instructions are included.
+      - Domain (Financial / Healthcare / etc.) — controls the persona.
 
     Args:
         domain: One of the AVAILABLE_DOMAINS values.
         mode: One of MODE_KB_ONLY, MODE_WEB_ONLY, MODE_HYBRID, MODE_DIRECT.
+        model: The LLM model string (e.g. "gemini-2.5-flash-lite").
+               If provided, model-capability-specific instructions are
+               injected. Pass None to skip capability instructions.
 
     Returns:
         A complete system prompt string.
@@ -333,28 +341,32 @@ def get_system_prompt(domain: str, mode: str = MODE_KB_ONLY) -> str:
     # Mode-specific grounding instructions
     grounding_instructions = {
         MODE_KB_ONLY: (
-            "5. Base your answers ONLY on the retrieved knowledge base "
-            "context. If the context does not contain sufficient "
+            "You MUST search the knowledge base before answering.\n"
+            "Base your answers ONLY on the retrieved knowledge base "
+            "context. Do NOT use your pre-training knowledge for "
+            "questions about the uploaded documents.\n"
+            "If the context does not contain sufficient "
             "information, state: 'I do not have enough information in "
             "the current knowledge base to answer that question "
             "accurately.' Do NOT hallucinate or guess.\n"
         ),
         MODE_WEB_ONLY: (
-            "5. Base your answers on the web search results provided "
+            "Base your answers on the web search results provided "
             "as observations. Always cite the source URLs when "
             "presenting information. If the search results do not "
             "contain sufficient information, state that clearly. "
             "Do NOT hallucinate or fabricate information.\n"
         ),
         MODE_HYBRID: (
-            "5. Base your answers on BOTH the retrieved knowledge base "
+            "You MUST search the knowledge base before answering.\n"
+            "Base your answers on BOTH the retrieved knowledge base "
             "context and the web search results. When information "
             "conflicts, prefer the knowledge base (as it represents "
             "the user's curated documents). Always cite source URLs "
             "for web-derived information. Do NOT hallucinate.\n"
         ),
         MODE_DIRECT: (
-            "5. Answer using your built-in knowledge. Provide "
+            "Answer using your built-in knowledge. Provide "
             "accurate, helpful responses. If you are uncertain about "
             "a factual claim, state the uncertainty rather than "
             "guessing.\n"
@@ -364,7 +376,7 @@ def get_system_prompt(domain: str, mode: str = MODE_KB_ONLY) -> str:
     grounding = grounding_instructions.get(mode, grounding_instructions[MODE_KB_ONLY])
 
     formatting = (
-        "6. Use clean, consistent formatting with proper markdown. "
+        "Use clean, consistent formatting with proper markdown. "
         "Avoid excessive dashes. Structure answers with clear paragraphs "
         "and bullet points where appropriate.\n"
     )
@@ -407,7 +419,22 @@ def get_system_prompt(domain: str, mode: str = MODE_KB_ONLY) -> str:
     }
 
     persona = domain_personas.get(domain, domain_personas["Custom/General"])
-    return f"{base_guardrails}\n{grounding}\n{formatting}\n\nDOMAIN PERSONA:\n{persona}"
+
+    # ── Model-capability instructions ──────────────────────
+    # Vision models get image handling guidance; text-only models do not
+    model_instructions = ""
+    if model and is_vision_model(model):
+        model_instructions = (
+            "You can process images if the user attaches them.\n"
+        )
+
+    return (
+        f"{base_guardrails}\n"
+        f"{grounding}\n"
+        f"{model_instructions}"
+        f"{formatting}\n\n"
+        f"DOMAIN PERSONA:\n{persona}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

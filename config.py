@@ -13,13 +13,83 @@ behavior without touching core logic.
 EMBEDDING_MODEL: str = "models/gemini-embedding-001"
 
 # Primary LLM for generation and ReAct reasoning
-PRIMARY_LLM_MODEL: str = "gemini-2.5-flash-lite"
+# Uses the fastest available flash-lite model for low latency.
+PRIMARY_LLM_MODEL: str = "gemini-2.0-flash-lite"
 
-# Fallback LLM when primary is rate-limited (different quota pool)
+# Fallback LLM when primary is rate-limited or unavailable
 FALLBACK_LLM_MODEL: str = "gemini-2.0-flash"
 
 # Alias for backward-compatible access
 LLM_MODEL: str = PRIMARY_LLM_MODEL
+
+# Models known to support image/vision input
+# These are tried first when the query includes an image.
+VISION_CAPABLE_MODELS: list[str] = [
+    # Flash family
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-image",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-omni-flash-preview",
+    "gemini-3.1-flash-live-preview",
+    "gemini-2.5-flash-native-audio-latest",
+    # Pro family
+    "gemini-2.5-pro",
+    "gemini-pro-latest",
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview-customtools",
+    # 3.x flash variants (likely vision)
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-image-preview",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    # Image-specific
+    "gemini-3-pro-image-preview",
+    "gemini-3-pro-image",
+    # Fallback vision models (slower but reliable)
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
+# Models that are text-only (non-vision)
+# Trying to send images to these will cause API errors.
+NON_VISION_MODELS: list[str] = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-2.0-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemma-4-26b-a4b-it",
+    "gemma-4-31b-it",
+]
+
+def is_vision_model(model: str) -> bool:
+    """Return True if the model supports image input."""
+    if model in VISION_CAPABLE_MODELS:
+        return True
+    if model in NON_VISION_MODELS:
+        return False
+    # Unknown model — assume non-vision to avoid hard errors
+    return False
+
+# Curated model candidates for the Registry — tested lazily, one at a time
+# MAX 3 per category to avoid spamming the API with test calls.
+# Ordered by preference (first = fastest / most available).
+TEXT_MODEL_CANDIDATES: list[str] = [
+    "gemini-3.1-flash-lite",       # fastest text-only (replaced quota-exhausted gemini-2.0-flash-lite)
+    "gemini-2.5-flash-lite",      # newer, still fast
+    "gemini-2.0-flash",           # fast, vision-capable fallback
+]
+
+VISION_MODEL_CANDIDATES: list[str] = [
+    "gemini-2.0-flash",           # fastest vision model
+    "gemini-2.5-flash",           # newer, good quality
+    "gemini-2.0-flash-001",       # alternate variant
+]
 
 # Low temperature for deterministic, factual responses
 LLM_TEMPERATURE: float = 0.1
@@ -54,14 +124,14 @@ MODE_MAP: dict[str, str] = {
 
 # ── Retrieval Configuration ──────────────────────────────────
 # Number of documents to retrieve per query
-DEFAULT_TOP_K: int = 5
+DEFAULT_TOP_K: int = 8
 
 # Hybrid search weight: 0.0 = pure vector, 1.0 = pure BM25
 DEFAULT_ALPHA: float = 0.5
 
 # Text chunking parameters for document ingestion
-CHUNK_SIZE: int = 500
-CHUNK_OVERLAP: int = 50
+CHUNK_SIZE: int = 2000
+CHUNK_OVERLAP: int = 200
 
 # Maximum characters to extract from a single file
 MAX_CHARS_PER_FILE: int = 500_000
