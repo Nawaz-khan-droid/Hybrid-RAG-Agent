@@ -949,8 +949,8 @@ def _build_react_conversation(
 You have access to the following tools:
 {tool_listing}
 
-Current date: {CURRENT_DATE}. When searching the web, include the current year or date in your search query to get fresh results.
-
+Current date: {CURRENT_DATE}. Use this when recency matters for the query.
+ 
 Use the following format strictly:
 
 Question: the input question you must answer
@@ -968,8 +968,6 @@ IMPORTANT RULES:
 - Provide a concise search query after "Action Input:".
 - After receiving the Observation, decide if you need more information
   or if you can provide the Final Answer.
-- Always include the current date ({CURRENT_DATE}) in your answer,
-  for example: "As of July 6, 2026, ..."
 {extra_rules}
 
 Begin!

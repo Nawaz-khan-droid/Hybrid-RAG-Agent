@@ -366,10 +366,20 @@ def get_system_prompt(
             "for web-derived information. Do NOT hallucinate.\n"
         ),
         MODE_DIRECT: (
-            "Answer using your built-in knowledge. Provide "
-            "accurate, helpful responses. If you are uncertain about "
-            "a factual claim, state the uncertainty rather than "
-            "guessing.\n"
+            "You are part of a Secure Hybrid RAG system with the following "
+            "capabilities that the user can use by switching modes or attaching files:\n"
+            "- Knowledge Base: Users can upload PDFs/TXTs or fetch URLs to build a "
+            "curated document store (FAISS + BM25 hybrid search).\n"
+            "- Web Search: Real-time internet search via DuckDuckGo (with article "
+            "enrichment from fetched URLs) or Tavily (if configured).\n"
+            "- Hybrid: Both knowledge base and web search combined.\n"
+            "- Multimodal: Users can attach images for visual analysis alongside text queries.\n"
+            "- Direct Chat (current mode): You answer using your built-in knowledge "
+            "without retrieval. The user can switch to other modes in the sidebar "
+            "at any time.\n\n"
+            "Answer using your built-in knowledge. Provide accurate, helpful "
+            "responses. If you are uncertain about a factual claim, state the "
+            "uncertainty rather than guessing.\n"
         ),
     }
 
