@@ -1291,13 +1291,15 @@ def _ocr_pdf_with_gemini(
 
         client = genai.Client(api_key=api_key)
 
-        # Build multimodal prompt with proper Part objects
+        # Build multimodal prompt with proper Part objects (keyword-only args)
         parts = [
             types.Part.from_text(
-                "Extract ALL text from these PDF page images. "
-                "Preserve the original structure: paragraphs, headings, "
-                "lists, and code blocks. Return only the extracted text, "
-                "no commentary."
+                text=(
+                    "Extract ALL text from these PDF page images. "
+                    "Preserve the original structure: paragraphs, headings, "
+                    "lists, and code blocks. Return only the extracted text, "
+                    "no commentary."
+                )
             ),
         ]
         for img in images:
