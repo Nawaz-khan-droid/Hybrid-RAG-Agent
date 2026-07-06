@@ -1,3 +1,15 @@
+---
+title: Hybrid RAG Agent
+emoji: 🧠
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: "1.32.0"
+python_version: "3.13"
+app_file: app.py
+pinned: false
+---
+
 # Secure Hybrid RAG Agent
 
 A functional prototype of a RAG (Retrieval-Augmented Generation) system with a ReAct agent, deployable on **Streamlit Community Cloud** (free tier). Designed for single-user experimentation and small-scale demos, not production workloads.
